@@ -131,6 +131,18 @@ func (cli *SNutanixClient) getDefaultClient(timeout time.Duration) *http.Client 
 		return nil, nil
 	}
 	httputils.SetClientProxyFunc(client, proxy)
+
+	ts, _ := client.Transport.(*http.Transport)
+	client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		if cli.cpcfg.ReadOnly {
+			if req.Method == "GET" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
+
 	return client
 }
 

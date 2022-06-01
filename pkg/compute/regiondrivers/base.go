@@ -453,8 +453,8 @@ func (self *SBaseRegionDriver) IsSupportedNatAutoRenew() bool {
 	return true
 }
 
-func (self *SBaseRegionDriver) RequestAssociatEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
-	return httperrors.NewNotImplementedError("RequestAssociatEip")
+func (self *SBaseRegionDriver) RequestAssociateEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
+	return httperrors.NewNotImplementedError("RequestAssociateEip")
 }
 
 func (self *SBaseRegionDriver) RequestSyncAccessGroup(ctx context.Context, userCred mcclient.TokenCredential, fs *models.SFileSystem, mt *models.SMountTarget, ag *models.SAccessGroup, task taskman.ITask) error {
@@ -491,4 +491,19 @@ func (self *SBaseRegionDriver) RequestDeleteInstanceBackup(ctx context.Context, 
 
 func (self *SBaseRegionDriver) ValidateCreateCdnData(ctx context.Context, userCred mcclient.TokenCredential, input api.CDNDomainCreateInput) (api.CDNDomainCreateInput, error) {
 	return input, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateCdnData")
+}
+
+func (self *SBaseRegionDriver) RequestSyncInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, ib *models.SInstanceBackup, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "SyncInstanceBackupStatus")
+}
+
+func (self *SBaseRegionDriver) RequestSyncBackupStorageStatus(ctx context.Context, userCred mcclient.TokenCredential, bs *models.SBackupStorage, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "SyncBackupStorageStatus")
+}
+
+func (self *SBaseRegionDriver) RequestPackInstanceBackup(ctx context.Context, ib *models.SInstanceBackup, task taskman.ITask, packageName string) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestPackInstanceBackup")
+}
+func (self *SBaseRegionDriver) RequestUnpackInstanceBackup(ctx context.Context, ib *models.SInstanceBackup, task taskman.ITask, packageName string, metadataOnly bool) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestUnpackInstanceBackup")
 }

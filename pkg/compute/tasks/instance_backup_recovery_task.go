@@ -16,17 +16,17 @@ package tasks
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/compute/models"
-	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/mcclient/auth"
-	compute_modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/util/logclient"
 )
 
@@ -42,40 +42,71 @@ func (self *InstanceBackupRecoveryTask) taskFailed(ctx context.Context, ib *mode
 	reasonStr, _ := reason.GetString()
 	ib.SetStatus(self.UserCred, compute.INSTANCE_BACKUP_STATUS_CREATE_FAILED, reasonStr)
 	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_RECOVERY, reason, self.UserCred, false)
+	db.OpsLog.LogEvent(ib, db.ACT_RECOVERY_FAIL, ib.GetShortDesc(ctx), self.GetUserCred())
 	self.SetStageFailed(ctx, reason)
 }
 
 func (self *InstanceBackupRecoveryTask) taskSuccess(ctx context.Context, ib *models.SInstanceBackup) {
 	ib.SetStatus(self.UserCred, compute.INSTANCE_BACKUP_STATUS_READY, "")
 	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_RECOVERY, nil, self.UserCred, true)
+	db.OpsLog.LogEvent(ib, db.ACT_RECOVERY, ib.GetShortDesc(ctx), self.GetUserCred())
 	self.SetStageComplete(ctx, nil)
 }
 
 func (self *InstanceBackupRecoveryTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	ib := obj.(*models.SInstanceBackup)
+
+	sourceInput := compute.ServerCreateInput{}
+
 	serverName, _ := self.Params.GetString("server_name")
 	if serverName == "" {
 		serverName, _ = ib.ServerConfig.GetString("name")
 	}
-	sourceInput := &compute.ServerCreateInput{}
-	sourceInput.ServerConfigs = &compute.ServerConfigs{}
 	sourceInput.GenerateName = serverName
-	sourceInput.Description = fmt.Sprintf("recovery from instance backup %s", ib.GetName())
+	sourceInput.Description = fmt.Sprintf("recovered from instance backup %s", ib.GetName())
 	sourceInput.InstanceBackupId = ib.GetId()
-	sourceInput.Hypervisor = compute.HYPERVISOR_KVM
-	taskHeader := self.GetTaskRequestHeader()
-	session := auth.GetSession(ctx, self.UserCred, "", "")
-	session.Header.Set(mcclient.TASK_NOTIFY_URL, taskHeader.Get(mcclient.TASK_NOTIFY_URL))
-	session.Header.Set(mcclient.TASK_ID, taskHeader.Get(mcclient.TASK_ID))
-	serverData, err := compute_modules.Servers.Create(session, jsonutils.Marshal(sourceInput))
+
+	// PANIC ?????
+	// sourceInput.Hypervisor = compute.HYPERVISOR_KVM
+
+	ownerId := ib.GetOwnerId()
+
+	projectId, _ := self.Params.GetString("project_id")
+	if projectId == "" {
+		projectId, _ = ib.ServerConfig.GetString("tenant_id")
+	}
+	if projectId != "" {
+		tenant, err := db.TenantCacheManager.FetchTenantByIdOrName(ctx, projectId)
+		if err != nil && errors.Cause(err) != sql.ErrNoRows {
+			self.taskFailed(ctx, ib, jsonutils.NewString(err.Error()))
+			return
+		}
+		if tenant != nil {
+			sourceInput.ProjectId = tenant.Id
+			sourceInput.ProjectDomainId = tenant.DomainId
+			ownerId = &db.SOwnerId{DomainId: tenant.DomainId, ProjectId: tenant.Id}
+		}
+	}
+
+	params := sourceInput.JSON(sourceInput)
+	guestObj, err := db.DoCreate(models.GuestManager, ctx, self.UserCred, nil, params, ownerId)
 	if err != nil {
 		self.taskFailed(ctx, ib, jsonutils.NewString(err.Error()))
 		return
 	}
-	guestId, _ := serverData.GetString("id")
-	params := jsonutils.NewDict()
-	params.Set("guest_id", jsonutils.NewString(guestId))
+	guest := guestObj.(*models.SGuest)
+
+	func() {
+		lockman.LockObject(ctx, guest)
+		defer lockman.ReleaseObject(ctx, guest)
+
+		guest.PostCreate(ctx, self.UserCred, ownerId, nil, params)
+	}()
+
+	params.Set("guest_id", jsonutils.NewString(guest.Id))
 	self.SetStage("OnCreateGuest", params)
+	params.Set("parent_task_id", jsonutils.NewString(self.GetTaskId()))
+	models.GuestManager.OnCreateComplete(ctx, []db.IModel{guest}, self.UserCred, ownerId, nil, params)
 }
 
 func (self *InstanceBackupRecoveryTask) OnCreateGuest(ctx context.Context, ib *models.SInstanceBackup, data jsonutils.JSONObject) {

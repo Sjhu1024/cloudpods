@@ -22,14 +22,15 @@ import (
 	"path"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/timeutils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	hostapi "yunion.io/x/onecloud/pkg/apis/host"
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudprovider"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
@@ -39,11 +40,15 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/storageman/backupstorage"
 	"yunion.io/x/onecloud/pkg/hostman/storageman/remotefile"
 	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	identity_modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/image"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
+	"yunion.io/x/onecloud/pkg/util/zeroclean"
 )
 
 var (
@@ -92,14 +97,6 @@ func (s *SLocalStorage) GetComposedName() string {
 	return fmt.Sprintf("host_%s_%s_storage_%d", s.Manager.host.GetMasterIp(), s.StorageType(), s.Index)
 }
 
-func (s *SLocalStorage) SyncStorageSize() error {
-	content := jsonutils.NewDict()
-	content.Set("actual_capacity_used", jsonutils.NewInt(int64(s.GetUsedSizeMb())))
-	_, err := modules.Storages.Put(
-		hostutils.GetComputeSession(context.Background()),
-		s.StorageId, content)
-	return err
-}
 func (s *SLocalStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) error {
 	info := input.DiskInfo
 	backupDir := s.GetBackupDir()
@@ -120,18 +117,41 @@ func (s *SLocalStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, in
 			return errors.Wrap(err, "unable to storageBackupRecovery")
 		}
 	}
-	img, err := qemuimg.NewQemuImage(backupPath)
+	/*img, err := qemuimg.NewQemuImage(backupPath)
 	if err != nil {
-		log.Errorln("unable to new qemu image for %s: %s", backupPath, err.Error())
-		return err
+		log.Errorf("unable to new qemu image for %s: %s", backupPath, err.Error())
+		return errors.Wrapf(err, "unable to new qemu image for %s", backupPath)
 	}
-	_, err = img.Clone(disk.GetPath(), qemuimg.QCOW2, false)
-	return err
+	if info.Encryption {
+		img.SetPassword(info.EncryptInfo.Key)
+	}
+	_, err = img.Clone(disk.GetPath(), qemuimg.QCOW2, false)*/
+	img, err := qemuimg.NewQemuImage(disk.GetPath())
+	if err != nil {
+		log.Errorf("NewQemuImage fail %s %s", disk.GetPath(), err)
+		return errors.Wrapf(err, "unable to new qemu image for %s", disk.GetPath())
+	}
+	var (
+		encKey string
+		encFmt qemuimg.TEncryptFormat
+		encAlg seclib2.TSymEncAlg
+	)
+	if info.Encryption {
+		encKey = info.EncryptInfo.Key
+		encFmt = qemuimg.EncryptFormatLuks
+		encAlg = info.EncryptInfo.Alg
+	}
+	err = img.CreateQcow2(0, false, backupPath, encKey, encFmt, encAlg)
+	if err != nil {
+		log.Errorf("CreateQcow2 fail %s", err)
+		return errors.Wrapf(err, "CreateQcow2 %s fail", backupPath)
+	}
+	return nil
 }
 
 func (s *SLocalStorage) StorageBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	sbParams := params.(*SStorageBackup)
-	backupStorage, err := backupstorage.NewBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +170,7 @@ func (s *SLocalStorage) StorageBackup(ctx context.Context, params interface{}) (
 }
 
 func (s *SLocalStorage) storageBackupRecovery(ctx context.Context, sbParams *SStorageBackup) (jsonutils.JSONObject, error) {
-	backupStorage, err := backupstorage.NewBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +229,7 @@ func (s *SLocalStorage) SyncStorageInfo() (jsonutils.JSONObject, error) {
 	content.Set("actual_capacity_used", jsonutils.NewInt(int64(s.GetUsedSizeMb())))
 	content.Set("storage_type", jsonutils.NewString(s.StorageType()))
 	content.Set("medium_type", jsonutils.NewString(s.GetMediumType()))
-	content.Set("zone", jsonutils.NewString(s.GetZoneName()))
+	content.Set("zone", jsonutils.NewString(s.GetZoneId()))
 	if len(s.Manager.LocalStorageImagecacheManager.GetId()) > 0 {
 		content.Set("storagecache_id",
 			jsonutils.NewString(s.Manager.LocalStorageImagecacheManager.GetId()))
@@ -291,9 +311,9 @@ func (s *SLocalStorage) Detach() error {
 	return nil
 }
 
-func (s *SLocalStorage) DeleteDiskfile(diskpath string) error {
+func (s *SLocalStorage) DeleteDiskfile(diskpath string, skipRecycle bool) error {
 	log.Infof("Start Delete %s", diskpath)
-	if options.HostOptions.RecycleDiskfile {
+	if options.HostOptions.RecycleDiskfile && (!skipRecycle || options.HostOptions.AlwaysRecycleDiskfile) {
 		var (
 			destDir  = s.getRecyclePath()
 			destFile = fmt.Sprintf("%s.%d", path.Base(diskpath), time.Now().Unix())
@@ -306,6 +326,10 @@ func (s *SLocalStorage) DeleteDiskfile(diskpath string) error {
 		return procutils.NewCommand("mv", "-f", diskpath, path.Join(destDir, destFile)).Run()
 	} else {
 		log.Infof("Delete disk file %s immediately", diskpath)
+		if options.HostOptions.ZeroCleanDiskData {
+			// try to zero clean files in subdir
+			zeroclean.ZeroDir(diskpath)
+		}
 		return procutils.NewCommand("rm", "-rf", diskpath).Run()
 	}
 }
@@ -325,19 +349,37 @@ func (s *SLocalStorage) GetImgsaveBackupPath() string {
 }
 
 func (s *SLocalStorage) SaveToGlance(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
-	data, ok := params.(*jsonutils.JSONDict)
+	info, ok := params.(SStorageSaveToGlanceInfo)
 	if !ok {
 		return nil, hostutils.ParamsError
 	}
+	data := info.DiskInfo
 
 	var (
 		imageId, _   = data.GetString("image_id")
 		imagePath, _ = data.GetString("image_path")
 		compress     = jsonutils.QueryBoolean(data, "compress", true)
 		format, _    = data.GetString("format")
+		encKeyId, _  = data.GetString("encrypt_key_id")
 	)
 
-	if err := s.saveToGlance(ctx, imageId, imagePath, compress, format); err != nil {
+	var (
+		encKey    string
+		encFormat qemuimg.TEncryptFormat
+		encAlg    seclib2.TSymEncAlg
+	)
+	if len(encKeyId) > 0 {
+		session := auth.GetSession(ctx, info.UserCred, consts.GetRegion(), "")
+		key, err := identity_modules.Credentials.GetEncryptKey(session, encKeyId)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetEncryptKey")
+		}
+		encKey = key.Key
+		encFormat = qemuimg.EncryptFormatLuks
+		encAlg = key.Alg
+	}
+
+	if err := s.saveToGlance(ctx, imageId, imagePath, compress, format, encKey, encFormat, encAlg); err != nil {
 		log.Errorf("Save to glance failed: %s", err)
 		s.onSaveToGlanceFailed(ctx, imageId, err.Error())
 	}
@@ -361,10 +403,20 @@ func (s *SLocalStorage) SaveToGlance(ctx context.Context, params interface{}) (j
 }
 
 func (s *SLocalStorage) saveToGlance(ctx context.Context, imageId, imagePath string,
-	compress bool, format string) error {
-	ret, err := deployclient.GetDeployClient().SaveToGlance(context.Background(),
-		&deployapi.SaveToGlanceParams{DiskPath: imagePath, Compress: compress})
+	compress bool, format string, encryptKey string, encFormat qemuimg.TEncryptFormat, encAlg seclib2.TSymEncAlg) error {
+	log.Infof("saveToGlance %s", imagePath)
+	diskInfo := &deployapi.DiskInfo{
+		Path: imagePath,
+	}
+	if len(encryptKey) > 0 {
+		diskInfo.EncryptPassword = encryptKey
+		diskInfo.EncryptFormat = string(encFormat)
+		diskInfo.EncryptAlg = string(encAlg)
+	}
+	ret, err := deployclient.GetDeployClient().SaveToGlance(ctx,
+		&deployapi.SaveToGlanceParams{DiskInfo: diskInfo, Compress: compress})
 	if err != nil {
+		log.Errorf("GetDeployClient.SaveToGlance fail %s", err)
 		return err
 	}
 
@@ -374,11 +426,14 @@ func (s *SLocalStorage) saveToGlance(ctx context.Context, imageId, imagePath str
 			log.Errorln(err)
 			return err
 		}
+		if len(encryptKey) > 0 {
+			origin.SetPassword(encryptKey)
+		}
 		if len(format) == 0 {
 			format = options.HostOptions.DefaultImageSaveFormat
 		}
 		if format == "qcow2" {
-			if err := origin.Convert2Qcow2(true); err != nil {
+			if err := origin.Convert2Qcow2(true, encryptKey, encFormat, encAlg); err != nil {
 				log.Errorln(err)
 				return err
 			}
@@ -420,7 +475,7 @@ func (s *SLocalStorage) saveToGlance(ctx context.Context, imageId, imagePath str
 	}
 	params.Set("image_id", jsonutils.NewString(imageId))
 
-	_, err = image.Images.Upload(hostutils.GetImageSession(ctx, s.GetZoneName()),
+	_, err = image.Images.Upload(hostutils.GetImageSession(ctx, s.GetZoneId()),
 		params, f, size)
 	return err
 }
@@ -430,7 +485,7 @@ func (s *SLocalStorage) onSaveToGlanceFailed(ctx context.Context, imageId string
 	params.Set("status", jsonutils.NewString("killed"))
 	params.Set("reason", jsonutils.NewString(reason))
 	_, err := image.Images.PerformAction(
-		hostutils.GetImageSession(ctx, s.GetZoneName()),
+		hostutils.GetImageSession(ctx, ""),
 		imageId, "update-status", params,
 	)
 	if err != nil {
@@ -514,7 +569,7 @@ func (s *SLocalStorage) DestinationPrepareMigrate(
 		// create local disk
 		backingFile, _ := disksBackingFile.GetString(diskId)
 		size, _ := diskinfo.Int("size")
-		_, err := disk.CreateRaw(ctx, int(size), "qcow2", "", false, "", backingFile)
+		_, err := disk.CreateRaw(ctx, int(size), "qcow2", "", nil, "", backingFile)
 		if err != nil {
 			log.Errorln(err)
 			return err
@@ -566,7 +621,11 @@ func (s *SLocalStorage) CreateDiskFromSnapshot(
 ) error {
 	info := input.DiskInfo
 	if info.Protocol == "fuse" {
-		err := disk.CreateFromImageFuse(ctx, info.SnapshotUrl, int64(info.DiskSizeMb))
+		var encryptInfo *apis.SEncryptInfo
+		if info.Encryption {
+			encryptInfo = &info.EncryptInfo
+		}
+		err := disk.CreateFromImageFuse(ctx, info.SnapshotUrl, int64(info.DiskSizeMb), encryptInfo)
 		if err != nil {
 			return errors.Wrapf(err, "CreateFromImageFuse")
 		}

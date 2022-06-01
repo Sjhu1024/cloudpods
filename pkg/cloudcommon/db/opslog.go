@@ -34,7 +34,6 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/appsrv"
-	"yunion.io/x/onecloud/pkg/cloudcommon"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -66,7 +65,7 @@ type SOpsLog struct {
 	User     string `width:"128" charset:"utf8" list:"user" create:"required"`
 	DomainId string `width:"128" charset:"ascii" list:"user" create:"optional"`
 	Domain   string `width:"128" charset:"utf8" list:"user" create:"optional"`
-	Roles    string `width:"64" charset:"ascii" list:"user" create:"optional"`
+	Roles    string `width:"64" charset:"utf8" list:"user" create:"optional"`
 
 	OpsTime time.Time `nullable:"false" list:"user" clickhouse_ttl:"6m"`
 
@@ -89,7 +88,7 @@ func InitOpsLog() {
 			"opslog_tbl",
 			"event",
 			"events",
-			cloudcommon.ClickhouseDB,
+			ClickhouseDB,
 		)}
 		col := OpsLog.TableSpec().ColumnSpec("ops_time")
 		if clickCol, ok := col.(clickhouse.IClickhouseColumnSpec); ok {
@@ -528,6 +527,10 @@ func (log *SOpsLog) CustomizeCreate(ctx context.Context,
 	log.ProjectDomain = ownerId.GetProjectDomain()
 	log.ProjectDomainId = ownerId.GetProjectDomainId()
 	return log.SModelBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
+}
+
+func (log *SOpsLog) GetRecordTime() time.Time {
+	return log.OpsTime
 }
 
 func (manager *SOpsLogManager) FetchCustomizeColumns(

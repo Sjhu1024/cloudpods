@@ -173,10 +173,12 @@ func (m *QmpMonitor) read(r io.Reader) {
 	for scanner.Scan() {
 		var objmap map[string]*json.RawMessage
 		b := scanner.Bytes()
-		log.Infof("QMP Read %s: %s", m.server, string(b))
 		if err := json.Unmarshal(b, &objmap); err != nil {
 			log.Errorf("Unmarshal %s error: %s", m.server, err.Error())
 			continue
+		}
+		if val, ok := objmap["event"]; !ok || !utils.IsInStringArray(string(*val), ignoreEvents) {
+			log.Infof("QMP Read %s: %s", m.server, string(b))
 		}
 		if val, ok := objmap["error"]; ok {
 			var res = &Response{}
@@ -416,12 +418,15 @@ func (m *QmpMonitor) parseVersion(callback StringCallback) qmpMonitorCallBack {
 func (m *QmpMonitor) GetBlocks(callback func([]QemuBlock)) {
 	var cb = func(res *Response) {
 		if res.ErrorVal != nil {
+			log.Errorf("GetBlocks error %s", res.ErrorVal)
 			callback(nil)
+			return
 		}
 		jr, err := jsonutils.Parse(res.Return)
 		if err != nil {
 			log.Errorf("Get %s block error %s", m.server, err)
 			callback(nil)
+			return
 		}
 		blocks := []QemuBlock{}
 		jr.Unmarshal(&blocks)
@@ -582,6 +587,21 @@ func (m *QmpMonitor) DeviceAdd(dev string, params map[string]interface{}, callba
 	// m.Query(cmd, cb)
 }
 
+func (m *QmpMonitor) MigrateSetDowntime(dtSec float32, callback StringCallback) {
+	var (
+		cb = func(res *Response) {
+			callback(m.actionResult(res))
+		}
+	)
+	cmd := &Command{
+		Execute: "migrate-set-downtime",
+		Args: map[string]interface{}{
+			"value": dtSec,
+		},
+	}
+	m.Query(cmd, cb)
+}
+
 func (m *QmpMonitor) MigrateSetCapability(capability, state string, callback StringCallback) {
 	var (
 		cb = func(res *Response) {
@@ -608,7 +628,7 @@ func (m *QmpMonitor) MigrateSetCapability(capability, state string, callback Str
 	m.Query(cmd, cb)
 }
 
-func (m *QmpMonitor) MigrateSetParameter(key string, val string, callback StringCallback) {
+func (m *QmpMonitor) MigrateSetParameter(key string, val interface{}, callback StringCallback) {
 	var (
 		cb = func(res *Response) {
 			callback(m.actionResult(res))
@@ -971,4 +991,19 @@ func (m *QmpMonitor) NetdevAdd(id, netType string, params map[string]string, cal
 func (m *QmpMonitor) NetdevDel(id string, callback StringCallback) {
 	cmd := fmt.Sprintf("netdev_del %s", id)
 	m.HumanMonitorCommand(cmd, callback)
+}
+
+func (m *QmpMonitor) SaveState(stateFilePath string, callback StringCallback) {
+	var (
+		cb = func(res *Response) {
+			callback(m.actionResult(res))
+		}
+		cmd = &Command{
+			Execute: "migrate",
+			Args: map[string]interface{}{
+				"uri": getSaveStatefileUri(stateFilePath),
+			},
+		}
+	)
+	m.Query(cmd, cb)
 }

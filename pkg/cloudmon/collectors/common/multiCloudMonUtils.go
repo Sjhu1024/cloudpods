@@ -51,6 +51,7 @@ const (
 	ALERT_RECORD MonType = "alertRecord"
 
 	PING_PROBE MonType = "ping_probe"
+	USAGE      MonType = "usage"
 
 	K8S        MonType = "k8s"
 	K8S_DEPLOY         = MonType(K8S_MODULE_DEPLOY)
@@ -77,11 +78,12 @@ var (
 	SupportMetricBrands = []string{compute.CLOUD_PROVIDER_ALIYUN, compute.CLOUD_PROVIDER_VMWARE, compute.CLOUD_PROVIDER_APSARA,
 		compute.CLOUD_PROVIDER_QCLOUD, compute.CLOUD_PROVIDER_AZURE, compute.CLOUD_PROVIDER_AWS,
 		compute.CLOUD_PROVIDER_HUAWEI, compute.CLOUD_PROVIDER_HCSO, compute.CLOUD_PROVIDER_ZSTACK,
-		compute.CLOUD_PROVIDER_GOOGLE, compute.CLOUD_PROVIDER_ECLOUD, compute.CLOUD_PROVIDER_JDCLOUD}
+		compute.CLOUD_PROVIDER_GOOGLE, compute.CLOUD_PROVIDER_ECLOUD, compute.CLOUD_PROVIDER_JDCLOUD, compute.CLOUD_PROVIDER_BINGO_CLOUD}
 
 	ResMonTypeList = []string{string(SERVER), string(HOST), string(REDIS), string(RDS), string(OSS),
 		string(ELB), string(K8S)}
-	CustomizeMonTypeList = []string{string(CLOUDACCOUNT), string(STORAGE), string(ALERT_RECORD), string(PING_PROBE)}
+	CustomizeMonTypeList = []string{string(CLOUDACCOUNT), string(STORAGE), string(ALERT_RECORD), string(PING_PROBE),
+		string(USAGE)}
 )
 
 var OtherVmTags = map[string]string{
@@ -124,6 +126,8 @@ var ServerTags = map[string]string{
 	"scaling_group_id": "vm_scaling_group_id",
 	"domain_id":        "domain_id",
 	"project_domain":   "project_domain",
+	"account":          "account",
+	"account_id":       "account_id",
 }
 var HostTags = map[string]string{
 	"id":             "host_id",
@@ -142,6 +146,8 @@ var HostTags = map[string]string{
 	"brand":          "brand",
 	"domain_id":      "domain_id",
 	"project_domain": "project_domain",
+	"account":        "account",
+	"account_id":     "account_id",
 }
 var RdsTags = map[string]string{
 	"host":           "host",
@@ -630,7 +636,7 @@ func cloudproviderRunfunc(ctx context.Context, factory ICloudReportFactory, prov
 	session *mcclient.ClientSession) {
 	opt := o.Options
 	group, _ := errgroup.WithContext(ctx)
-	for i, _ := range ResMonTypeList {
+	for i := range ResMonTypeList {
 		resType := ResMonTypeList[i]
 		group.Go(func() error {
 			log.Errorf("cloudprovider: %s,operator: %s start report().", provider.Name, resType)
@@ -652,7 +658,8 @@ func CustomizeRunFunc(ctx context.Context, factory ICloudReportFactory, provider
 	opt := o.Options
 	err := factory.NewCloudReport(provider, session, &opt.ReportOptions, "").Report()
 	if err != nil {
-		log.Errorf("provider: %s report metric err: %v", provider.Name, err)
+		// provider maybe nil
+		log.Errorf("provider: %v report metric err: %v", provider, err)
 		return
 	}
 	log.Errorf("operator: %s report() end.", factory.GetId())

@@ -195,10 +195,17 @@ func (s *SRbdStorage) resizeImage(pool string, name string, sizeMb uint64) error
 	if err != nil {
 		return errors.Wrapf(err, "GetImage")
 	}
+	info, err := img.GetInfo()
+	if err != nil {
+		return errors.Wrapf(err, "img.GetInfo")
+	}
+	if uint64(info.SizeByte/1024/1024) >= sizeMb {
+		return nil
+	}
 	return img.Resize(int64(sizeMb))
 }
 
-func (s *SRbdStorage) deleteImage(pool string, name string) error {
+func (s *SRbdStorage) deleteImage(pool string, name string, skipRecycle bool) error {
 	client, err := s.GetClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
@@ -317,9 +324,9 @@ func (s *SRbdStorage) createBackup(pool string, diskId string, snapshotId string
 	}
 	defer backupImg.Delete()
 	// convert backupStorage
-	backupStorage, err := backupstorage.NewBackupStorage(backupStorageId, backupStorageAccessInfo)
+	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo)
 	if err != nil {
-		return 0, errors.Wrap(err, "unable to NewNFSBackupStorage")
+		return 0, errors.Wrap(err, "unable to GetBackupStorage")
 	}
 	srcPath := fmt.Sprintf("rbd:%s/%s%s", pool, backupName, s.getStorageConfString())
 	// convert
@@ -363,23 +370,23 @@ func (s *SRbdStorage) deleteSnapshot(pool string, diskId string, snapshotId stri
 	return snap.Delete()
 }
 
-func (s *SRbdStorage) SyncStorageSize() error {
-	content := jsonutils.NewDict()
+func (s *SRbdStorage) SyncStorageSize() (api.SHostStorageStat, error) {
+	stat := api.SHostStorageStat{
+		StorageId: s.StorageId,
+	}
+
 	client, err := s.GetClient()
 	if err != nil {
-		return errors.Wrapf(err, "GetClient")
+		return stat, errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
 	capacity, err := client.GetCapacity()
 	if err != nil {
-		return errors.Wrapf(err, "GetCapacity")
+		return stat, errors.Wrapf(err, "GetCapacity")
 	}
-	content.Set("capacity", jsonutils.NewInt(int64(capacity.CapacitySizeKb/1024)))
-	content.Set("actual_capacity_used", jsonutils.NewInt(int64(capacity.UsedCapacitySizeKb/1024)))
-	_, err = modules.Storages.Put(
-		hostutils.GetComputeSession(context.Background()),
-		s.StorageId, content)
-	return errors.Wrapf(err, "storage update")
+	stat.CapacityMb = capacity.CapacitySizeKb / 1024
+	stat.ActualCapacityUsedMb = capacity.UsedCapacitySizeKb / 1024
+	return stat, nil
 }
 
 func (s *SRbdStorage) SyncStorageInfo() (jsonutils.JSONObject, error) {
@@ -400,7 +407,7 @@ func (s *SRbdStorage) SyncStorageInfo() (jsonutils.JSONObject, error) {
 			"capacity":             capacity.CapacitySizeKb / 1024,
 			"actual_capacity_used": capacity.UsedCapacitySizeKb / 1024,
 			"status":               api.STORAGE_ONLINE,
-			"zone":                 s.GetZoneName(),
+			"zone":                 s.GetZoneId(),
 		}
 		return modules.Storages.Put(hostutils.GetComputeSession(context.Background()), s.StorageId, jsonutils.Marshal(content))
 	}
@@ -487,7 +494,7 @@ func (s *SRbdStorage) SaveToGlance(ctx context.Context, params interface{}) (jso
 func (s *SRbdStorage) onSaveToGlanceFailed(ctx context.Context, imageId string) {
 	params := jsonutils.NewDict()
 	params.Set("status", jsonutils.NewString("killed"))
-	_, err := image.Images.Update(hostutils.GetImageSession(ctx, s.GetZoneName()),
+	_, err := image.Images.Update(hostutils.GetImageSession(ctx, ""),
 		imageId, params)
 	if err != nil {
 		log.Errorln(err)
@@ -495,8 +502,11 @@ func (s *SRbdStorage) onSaveToGlanceFailed(ctx context.Context, imageId string) 
 }
 
 func (s *SRbdStorage) saveToGlance(ctx context.Context, imageId, imagePath string, compress bool, format string) error {
+	diskInfo := &deployapi.DiskInfo{
+		Path: imagePath,
+	}
 	ret, err := deployclient.GetDeployClient().SaveToGlance(context.Background(),
-		&deployapi.SaveToGlanceParams{DiskPath: imagePath, Compress: compress})
+		&deployapi.SaveToGlanceParams{DiskInfo: diskInfo, Compress: compress})
 	if err != nil {
 		return err
 	}
@@ -544,7 +554,7 @@ func (s *SRbdStorage) saveToGlance(ctx context.Context, imageId, imagePath strin
 	}
 	params.Set("image_id", jsonutils.NewString(imageId))
 
-	_, err = image.Images.Upload(hostutils.GetImageSession(ctx, s.GetZoneName()),
+	_, err = image.Images.Upload(hostutils.GetImageSession(ctx, ""),
 		params, f, size)
 	return err
 }
@@ -570,9 +580,9 @@ func (s *SRbdStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, inpu
 	backup := input.DiskInfo.Backup
 	pool, _ := s.StorageConf.GetString("pool")
 	destPath := fmt.Sprintf("rbd:%s/%s%s", pool, disk.GetId(), s.getStorageConfString())
-	backupStorage, err := backupstorage.NewBackupStorage(backup.BackupStorageId, backup.BackupStorageAccessInfo)
+	backupStorage, err := backupstorage.GetBackupStorage(backup.BackupStorageId, backup.BackupStorageAccessInfo)
 	if err != nil {
-		return errors.Wrap(err, "unable to NewNFSBackupStorage")
+		return errors.Wrap(err, "unable to GetBackupStorage")
 	}
 	err = backupStorage.ConvertTo(destPath, qemuimg.RAW, backup.BackupId)
 	if err != nil {

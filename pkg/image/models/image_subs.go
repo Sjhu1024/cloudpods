@@ -22,14 +22,18 @@ import (
 	"path/filepath"
 	"strings"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/image"
+	noapi "yunion.io/x/onecloud/pkg/apis/notify"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/image/options"
 	"yunion.io/x/onecloud/pkg/image/torrent"
+	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
-	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/torrentutils"
 )
 
@@ -100,18 +104,22 @@ func (manager *SImageSubformatManager) GetAllSubImages(id string) []SImageSubfor
 	return subImgs
 }
 
-func (self *SImageSubformat) DoConvert(image *SImage) error {
+func (self *SImageSubformat) isLocal() bool {
+	return strings.HasPrefix(self.Location, LocalFilePrefix)
+}
+
+func (self *SImageSubformat) doConvert(image *SImage) error {
 	err := self.Save(image)
 	if err != nil {
 		log.Errorf("fail to convert image %s", err)
 		return err
 	}
-	err = self.SaveTorrent()
-	if err != nil {
-		log.Errorf("fail to convert image torrent %s", err)
-		return err
-	}
 	if options.Options.EnableTorrentService {
+		err = self.SaveTorrent()
+		if err != nil {
+			log.Errorf("fail to convert image torrent %s", err)
+			return err
+		}
 		err = self.seedTorrent(image.Id)
 		if err != nil {
 			log.Errorf("fail to seed torrent %s", err)
@@ -123,32 +131,31 @@ func (self *SImageSubformat) DoConvert(image *SImage) error {
 }
 
 func (self *SImageSubformat) Save(image *SImage) error {
+	var err error
+	defer func() {
+		if err != nil {
+			db.Update(self, func() error {
+				self.Status = api.IMAGE_STATUS_SAVE_FAIL
+				return nil
+			})
+		}
+	}()
 	if self.Status == api.IMAGE_STATUS_ACTIVE {
 		return nil
 	}
-	if self.Status != api.IMAGE_STATUS_QUEUED {
-		return nil // httperrors.NewInvalidStatusError("cannot save in status %s", self.Status)
-	}
-	location := image.GetPath(self.Format)
-	_, err := db.Update(self, func() error {
+	_, err = db.Update(self, func() error {
 		self.Status = api.IMAGE_STATUS_SAVING
-		self.Location = fmt.Sprintf("%s%s", LocalFilePrefix, location)
 		return nil
 	})
 	if err != nil {
 		log.Errorf("updateStatus fail %s", err)
 		return err
 	}
-	img, err := image.getQemuImage()
+	info, err := storage.ConvertImage(context.Background(), image, self.Format)
 	if err != nil {
-		log.Errorf("image.getQemuImage fail %s", err)
-		return err
+		return errors.Wrap(err, "unable to ConvertImage")
 	}
-	nimg, err := img.Clone(location, qemuimg.String2ImageFormat(self.Format), true)
-	if err != nil {
-		log.Errorf("img.Clone fail %s", err)
-		return err
-	}
+	location := image.GetPath(self.Format)
 	checksum, err := fileutils2.MD5(location)
 	if err != nil {
 		log.Errorf("fileutils2.Md5 fail %s", err)
@@ -160,10 +167,11 @@ func (self *SImageSubformat) Save(image *SImage) error {
 		return err
 	}
 	_, err = db.Update(self, func() error {
-		self.Location = fmt.Sprintf("%s%s", LocalFilePrefix, location)
+		self.Location = info.Location
 		self.Checksum = checksum
 		self.FastHash = fastHash
-		self.Size = nimg.ActualSizeBytes
+		self.Size = info.SizeBytes
+		self.Status = api.IMAGE_STATUS_ACTIVE
 		return nil
 	})
 	if err != nil {
@@ -177,9 +185,9 @@ func (self *SImageSubformat) SaveTorrent() error {
 	if self.TorrentStatus == api.IMAGE_STATUS_ACTIVE {
 		return nil
 	}
-	if self.TorrentStatus != api.IMAGE_STATUS_QUEUED {
-		return nil // httperrors.NewInvalidStatusError("cannot save torrent in status %s", self.Status)
-	}
+	// if self.TorrentStatus != api.IMAGE_STATUS_QUEUED {
+	// 	return nil // httperrors.NewInvalidStatusError("cannot save torrent in status %s", self.Status)
+	// }
 	imgPath := self.GetLocalLocation()
 	torrentPath := filepath.Join(options.Options.TorrentStoreDir, fmt.Sprintf("%s.torrent", filepath.Base(imgPath)))
 	_, err := db.Update(self, func() error {
@@ -193,7 +201,7 @@ func (self *SImageSubformat) SaveTorrent() error {
 	}
 	_, err = torrentutils.GenerateTorrent(imgPath, torrent.GetTrackers(), torrentPath)
 	if err != nil {
-		log.Errorf("torrentutils.GenerateTorrent fail %s", err)
+		log.Errorf("torrentutils.GenerateTorrent %s fail %s", imgPath, err)
 		return err
 	}
 	checksum, err := fileutils2.MD5(torrentPath)
@@ -241,7 +249,19 @@ func (self *SImageSubformat) StopTorrent() {
 	}
 }
 
-func (self *SImageSubformat) RemoveFiles(ctx context.Context) error {
+func (self *SImageSubformat) cleanup(ctx context.Context, userCred mcclient.TokenCredential) error {
+	err := self.removeFiles(ctx)
+	if err != nil {
+		return errors.Wrap(err, "removeFiles")
+	}
+	err = self.Delete(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "delete")
+	}
+	return nil
+}
+
+func (self *SImageSubformat) removeFiles(ctx context.Context) error {
 	self.StopTorrent()
 	location := self.getLocalTorrentLocation()
 	if len(location) > 0 && fileutils2.IsFile(location) {
@@ -294,12 +314,20 @@ func (self *SImageSubformat) GetDetails() SImageSubformatDetails {
 	return details
 }
 
-func (self *SImageSubformat) isActive(useFast bool) bool {
-	return isActive(self.GetLocalLocation(), self.Size, self.Checksum, self.FastHash, useFast)
+func (self *SImageSubformat) isActive(useFast bool, noCheckum bool) bool {
+	active, reason := isActive(self.GetLocalLocation(), self.Size, self.Checksum, self.FastHash, useFast, noCheckum)
+	if active || reason != FileChecksumMismatch {
+		return active
+	}
+	data := jsonutils.NewDict()
+	data.Set("name", jsonutils.NewString(self.ImageId))
+	notifyclient.SystemExceptionNotifyWithResult(context.TODO(), noapi.ActionChecksumTest, noapi.TOPIC_RESOURCE_IMAGE, noapi.ResultFailed, data)
+	return false
 }
 
 func (self *SImageSubformat) isTorrentActive() bool {
-	return isActive(self.getLocalTorrentLocation(), self.TorrentSize, self.TorrentChecksum, "", false)
+	active, _ := isActive(self.getLocalTorrentLocation(), self.TorrentSize, self.TorrentChecksum, "", false, false)
+	return active
 }
 
 func (self *SImageSubformat) SetStatus(status string) error {
@@ -318,9 +346,9 @@ func (self *SImageSubformat) setTorrentStatus(status string) error {
 	return err
 }
 
-func (self *SImageSubformat) checkStatus(useFast bool) {
+func (self *SImageSubformat) checkStatus(useFast bool, noChecksum bool) {
 	if strings.HasPrefix(self.Location, LocalFilePrefix) {
-		if self.isActive(useFast) {
+		if self.isActive(useFast, noChecksum) {
 			if self.Status != api.IMAGE_STATUS_ACTIVE {
 				self.SetStatus(api.IMAGE_STATUS_ACTIVE)
 			}

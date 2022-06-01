@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -67,6 +68,8 @@ type SLocalUser struct {
 	Name            string    `width:"255" charset:"utf8" nullable:"false"`
 	FailedAuthCount int       `nullable:"true"`
 	FailedAuthAt    time.Time `nullable:"true"`
+
+	NeedResetPassword tristate.TriState `default:"false" list:"domain"`
 }
 
 func (user *SLocalUser) GetId() string {
@@ -111,6 +114,7 @@ func (manager *SLocalUserManager) register(userId string, domainId string, name 
 	}
 
 	localUser = &SLocalUser{}
+	localUser.SetModelManager(manager, localUser)
 	localUser.UserId = userId
 	localUser.DomainId = domainId
 	localUser.Name = name
@@ -159,6 +163,24 @@ func (usr *SLocalUser) ClearFailedAuth() error {
 	_, err := db.Update(usr, func() error {
 		usr.FailedAuthCount = 0
 		usr.FailedAuthAt = time.Time{}
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "Update")
+	}
+	return nil
+}
+
+func (usr *SLocalUser) markNeedResetPassword(needReset bool) error {
+	if usr.NeedResetPassword.IsTrue() == needReset {
+		return nil
+	}
+	_, err := db.Update(usr, func() error {
+		if needReset {
+			usr.NeedResetPassword = tristate.True
+		} else {
+			usr.NeedResetPassword = tristate.False
+		}
 		return nil
 	})
 	if err != nil {

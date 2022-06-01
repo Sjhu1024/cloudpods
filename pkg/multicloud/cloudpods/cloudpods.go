@@ -16,6 +16,8 @@ package cloudpods
 
 import (
 	"context"
+	"net/http"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -92,6 +94,20 @@ type SCloudpodsClient struct {
 func (self *SCloudpodsClient) auth() error {
 	client := mcclient.NewClient(self.authURL, 0, self.debug, true, "", "")
 	client.SetHttpTransportProxyFunc(self.cpcfg.ProxyFunc)
+	ts, _ := client.GetClient().Transport.(*http.Transport)
+	client.SetTransport(cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" || req.Method == "HEAD" {
+				return nil, nil
+			}
+			// 认证
+			if req.Method == "POST" && req.URL.Path == "/v3/auth/tokens" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	}))
 	token, err := client.AuthenticateByAccessKey(self.accessKey, self.accessSecret, "cli")
 	if err != nil {
 		if errors.Cause(err) == httperrors.ErrUnauthorized {
@@ -125,8 +141,15 @@ func (self *SCloudpodsClient) get(manager ModelManager, id string, params map[st
 	if len(id) == 0 {
 		return errors.Wrap(cloudprovider.ErrNotFound, "empty id")
 	}
-	resp, err := manager.Get(self.s, id, jsonutils.Marshal(params))
+	body := jsonutils.NewDict()
+	for k, v := range params {
+		body.Set(k, jsonutils.NewString(v))
+	}
+	resp, err := manager.Get(self.s, id, body)
 	if err != nil {
+		if strings.Contains(err.Error(), "NotFoundError") {
+			return errors.Wrapf(cloudprovider.ErrNotFound, err.Error())
+		}
 		return errors.Wrapf(err, "Get(%s)", id)
 	}
 	return resp.Unmarshal(retVal)

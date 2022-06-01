@@ -121,6 +121,7 @@ type SCloudAccountCreateBaseOptions struct {
 	ProxySetting    string `help:"proxy setting id or name" json:"proxy_setting"`
 	DryRun          bool   `help:"test create cloudaccount params"`
 	ShowSubAccounts bool   `help:"test and show subaccount info"`
+	ReadOnly        bool   `help:"Read only account"`
 }
 
 type SVMwareCloudAccountCreateOptions struct {
@@ -431,6 +432,16 @@ func (opts *SAliyunCloudAccountUpdateCredentialOptions) Params() (jsonutils.JSON
 	return jsonutils.Marshal(opts), nil
 }
 
+type SApsaraCloudAccountUpdateCredentialOptions struct {
+	SCloudAccountIdOptions
+	SAccessKeyCredential
+	OrganizationId int
+}
+
+func (opts *SApsaraCloudAccountUpdateCredentialOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
 type SAzureCloudAccountUpdateCredentialOptions struct {
 	SCloudAccountIdOptions
 	SAzureCredential
@@ -559,6 +570,10 @@ type SCloudAccountUpdateBaseOptions struct {
 	AutoCreateProject   *bool  `help:"automatically create local project for new remote project" negative:"no_auto_create_project"`
 	ProxySetting        string `help:"proxy setting name or id" json:"proxy_setting"`
 	SamlAuth            string `help:"Enable or disable saml auth" choices:"true|false"`
+
+	ReadOnly *bool `help:"is account read only" negative:"no_read_only"`
+
+	CleanLakeOfPermissions bool `help:"clean lake of permissions"`
 
 	Desc string `help:"Description" json:"description" token:"desc"`
 }
@@ -908,7 +923,6 @@ func (opts *SVMwareCloudAccountPrepareNetsOptions) Params() (jsonutils.JSONObjec
 
 type SApsaraCloudAccountCreateOptions struct {
 	SCloudAccountCreateBaseOptions
-	cloudprovider.SApsaraEndpoints
 	Endpoint string
 	SAccessKeyCredential
 }
@@ -1069,4 +1083,29 @@ func (opts *SNutanixCloudAccountUpdateCredentialOptions) Params() (jsonutils.JSO
 
 type SNutanixCloudAccountUpdateOptions struct {
 	SCloudAccountUpdateBaseOptions
+}
+
+type SBingoCloudAccountCreateOptions struct {
+	SCloudAccountCreateBaseOptions
+	Endpoint string
+	SAccessKeyCredential
+}
+
+func (opts *SBingoCloudAccountCreateOptions) Params() (jsonutils.JSONObject, error) {
+	params := jsonutils.Marshal(opts)
+	params.(*jsonutils.JSONDict).Add(jsonutils.NewString("BingoCloud"), "provider")
+	return params, nil
+}
+
+type SBingoCloudAccountUpdateOptions struct {
+	SCloudAccountUpdateBaseOptions
+}
+
+type SBingoCloudAccountUpdateCredentialOptions struct {
+	SCloudAccountIdOptions
+	SAccessKeyCredential
+}
+
+func (opts *SBingoCloudAccountUpdateCredentialOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts.SAccessKeyCredential), nil
 }

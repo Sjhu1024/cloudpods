@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	execlient "yunion.io/x/executor/client"
 	"yunion.io/x/log"
 	_ "yunion.io/x/sqlchemy/backends"
 
@@ -80,6 +81,12 @@ func StartService() {
 		}
 	}
 
+	log.Infof("exec socket path: %s", options.Options.ExecutorSocketPath)
+	if options.Options.EnableRemoteExecutor {
+		execlient.Init(options.Options.ExecutorSocketPath)
+		procutils.SetRemoteExecutor()
+	}
+
 	log.Infof("Target image formats %#v", opts.TargetImageFormats)
 
 	app_common.InitAuth(commonOpts, func() {
@@ -102,15 +109,18 @@ func StartService() {
 
 	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
 
-	go models.CheckImages()
 	models.Init(options.Options.StorageDriver)
-	if options.Options.StorageDriver == api.IMAGE_STORAGE_DRIVER_S3 {
-		initS3()
-	}
 
 	if len(options.Options.DeployServerSocketPath) > 0 {
 		log.Infof("deploy server socket path: %s", options.Options.DeployServerSocketPath)
 		deployclient.Init(options.Options.DeployServerSocketPath)
+	}
+
+	if options.Options.StorageDriver == api.IMAGE_STORAGE_DRIVER_S3 {
+		go initS3()
+	} else {
+		// Check the images after everything is ready
+		go models.CheckImages()
 	}
 
 	if !opts.IsSlaveNode {
@@ -167,11 +177,26 @@ func initS3() {
 			log.Fatalf("failed write s3 pass file")
 		}
 	}()
+	cleanS3Dir := func() {
+		// check the s3 mount point has been mounted by previous glance instance
+		// if it is mounted, just wait
+		for {
+			if err := procutils.NewRemoteCommandAsFarAsPossible("umount", options.Options.S3MountPoint).Run(); err == nil {
+				time.Sleep(time.Second)
+			} else {
+				break
+			}
+		}
+	}
+
+	cleanS3Dir()
 	if !fileutils2.Exists(options.Options.S3MountPoint) {
 		err := os.MkdirAll(options.Options.S3MountPoint, 0755)
 		if err != nil {
 			log.Fatalf("fail to create %s: %s", options.Options.S3MountPoint, err)
 		}
+	} else {
+		cleanS3Dir()
 	}
 
 	out, err := procutils.NewCommand("s3fs",
@@ -180,4 +205,17 @@ func initS3() {
 	if err != nil {
 		log.Fatalf("failed mount s3fs %s %s", err, out)
 	}
+	log.Infof("s3fs: %s", out)
+
+	for {
+		if err := procutils.NewRemoteCommandAsFarAsPossible("mountpoint", options.Options.S3MountPoint).Run(); err != nil {
+			// sleep 1 second
+			time.Sleep(time.Second)
+		} else {
+			break
+		}
+	}
+
+	// check image after s3 mounted
+	models.CheckImages()
 }

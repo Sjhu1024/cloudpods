@@ -31,22 +31,20 @@ import (
 )
 
 type BaseOptions struct {
-	Debug                          bool   `help:"debug mode"`
-	Help                           bool   `help:"Show help"`
-	AccessKey                      string `help:"Access key" default:"$APSARA_ACCESS_KEY" metavar:"APSARA_ACCESS_KEY"`
-	Secret                         string `help:"Secret" default:"$APSARA_SECRET" metavar:"APSARA_SECRET"`
-	cloudprovider.SApsaraEndpoints `help:"Endpoints for Apsara"`
-	Endpoint                       string `help:"Apsara endpoint" default:"$APSARA_ENDPOINT" metavar:"APSARA_ENDPOINT"`
-	RegionId                       string `help:"RegionId" default:"$APSARA_REGION" metavar:"APSARA_REGION"`
-	DEFAULT_REGION                 string `help:"Default region" default:"$APSARA_DEFAULT_REGION"`
-	SUBCOMMAND                     string `help:"apsaracli subcommand" subcommand:"true"`
+	Debug          bool   `help:"debug mode"`
+	AccessKey      string `help:"Access key" default:"$APSARA_ACCESS_KEY" metavar:"APSARA_ACCESS_KEY"`
+	Secret         string `help:"Secret" default:"$APSARA_SECRET" metavar:"APSARA_SECRET"`
+	Endpoint       string `help:"Apsara endpoint" default:"$APSARA_ENDPOINT" metavar:"APSARA_ENDPOINT"`
+	RegionId       string `help:"RegionId" default:"$APSARA_REGION" metavar:"APSARA_REGION"`
+	DEFAULT_REGION string `help:"Default region" default:"$APSARA_DEFAULT_REGION"`
+	SUBCOMMAND     string `help:"apsaracli subcommand" subcommand:"true"`
 }
 
 func getSubcommandParser() (*structarg.ArgumentParser, error) {
-	parse, e := structarg.NewArgumentParser(&BaseOptions{},
+	parse, e := structarg.NewArgumentParserWithHelp(&BaseOptions{},
 		"apsaracli",
 		"Command-line interface to apsara API.",
-		`See "apsaracli help COMMAND" for help on a specific command.`)
+		`See "apsaracli COMMAND --help" for help on a specific command.`)
 
 	if e != nil {
 		return nil, e
@@ -56,20 +54,8 @@ func getSubcommandParser() (*structarg.ArgumentParser, error) {
 	if subcmd == nil {
 		return nil, fmt.Errorf("No subcommand argument.")
 	}
-	type HelpOptions struct {
-		SUBCOMMAND string `help:"sub-command name"`
-	}
-	shellutils.R(&HelpOptions{}, "help", "Show help of a subcommand", func(args *HelpOptions) error {
-		helpstr, e := subcmd.SubHelpString(args.SUBCOMMAND)
-		if e != nil {
-			return e
-		} else {
-			fmt.Print(helpstr)
-			return nil
-		}
-	})
 	for _, v := range shellutils.CommandTable {
-		_, e := subcmd.AddSubParser(v.Options, v.Command, v.Desc, v.Callback)
+		_, e := subcmd.AddSubParserWithHelp(v.Options, v.Command, v.Desc, v.Callback)
 		if e != nil {
 			return nil, e
 		}
@@ -107,7 +93,6 @@ func newClient(options *BaseOptions) (*apsara.SRegion, error) {
 			options.AccessKey,
 			options.Secret,
 			options.Endpoint,
-			options.SApsaraEndpoints,
 		).Debug(options.Debug).
 			CloudproviderConfig(
 				cloudprovider.ProviderConfig{
@@ -137,31 +122,32 @@ func main() {
 	e = parser.ParseArgs(os.Args[1:], false)
 	options := parser.Options().(*BaseOptions)
 
-	if options.Help {
+	if parser.IsHelpSet() {
 		fmt.Print(parser.HelpString())
 		return
 	}
 	subcmd := parser.GetSubcommand()
 	subparser := subcmd.GetSubParser()
-	if e != nil {
+	if e != nil || subparser == nil {
 		if subparser != nil {
 			fmt.Print(subparser.Usage())
 		} else {
 			fmt.Print(parser.Usage())
 		}
 		showErrorAndExit(e)
+		return
 	}
 	suboptions := subparser.Options()
-	if options.SUBCOMMAND == "help" {
-		e = subcmd.Invoke(suboptions)
-	} else {
-		var region *apsara.SRegion
-		region, e = newClient(options)
-		if e != nil {
-			showErrorAndExit(e)
-		}
-		e = subcmd.Invoke(region, suboptions)
+	if subparser.IsHelpSet() {
+		fmt.Print(subparser.HelpString())
+		return
 	}
+	var region *apsara.SRegion
+	region, e = newClient(options)
+	if e != nil {
+		showErrorAndExit(e)
+	}
+	e = subcmd.Invoke(region, suboptions)
 	if e != nil {
 		showErrorAndExit(e)
 	}

@@ -17,6 +17,7 @@ package compute
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -49,6 +50,8 @@ func init() {
 	cmd.BatchDelete(&options.BaseIdsOptions{})
 	cmd.Perform("remove-all-netifs", &options.BaseIdOptions{})
 	cmd.Perform("probe-isolated-devices", &options.BaseIdOptions{})
+	cmd.Perform("class-metadata", &options.ResourceMetadataOptions{})
+	cmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
 
 	cmd.BatchPerform("enable", &options.BaseIdsOptions{})
 	cmd.BatchPerform("disable", &options.BaseIdsOptions{})
@@ -115,6 +118,33 @@ func init() {
 		return nil
 	})
 
+	type HostSysInfoOpt struct {
+		options.BaseIdOptions
+		Key    string `help:"The key for extract, e.g. 'cpu_info.processors'"`
+		Format string `help:"Output format" choices:"yaml|json" default:"yaml"`
+	}
+
+	R(&HostSysInfoOpt{}, "host-sysinfo", "Get host system info", func(s *mcclient.ClientSession, args *HostSysInfoOpt) error {
+		obj, err := modules.Hosts.Get(s, args.GetId(), nil)
+		if err != nil {
+			return err
+		}
+		keys := []string{"sys_info"}
+		if args.Key != "" {
+			keys = append(keys, strings.Split(args.Key, ".")...)
+		}
+		sysInfo, err := obj.Get(keys...)
+		if err != nil {
+			return errors.Wrap(err, "Get sys_info")
+		}
+		if args.Format == "yaml" {
+			fmt.Print(sysInfo.YAMLString())
+		} else {
+			fmt.Print(sysInfo.PrettyString())
+		}
+		return nil
+	})
+
 	type HostUpdateOptions struct {
 		ID                string  `help:"ID or Name of Host"`
 		Name              string  `help:"New name of the host"`
@@ -131,6 +161,8 @@ func init() {
 		IpmiUsername string `help:"IPMI user"`
 		IpmiPassword string `help:"IPMI password"`
 		IpmiIpAddr   string `help:"IPMI ip_addr"`
+
+		Sn string `help:"serial number"`
 	}
 	R(&HostUpdateOptions{}, "host-update", "Update information of a host", func(s *mcclient.ClientSession, args *HostUpdateOptions) error {
 		params := jsonutils.NewDict()
@@ -169,6 +201,9 @@ func init() {
 		}
 		if len(args.IpmiIpAddr) > 0 {
 			params.Add(jsonutils.NewString(args.IpmiIpAddr), "ipmi_ip_addr")
+		}
+		if len(args.Sn) > 0 {
+			params.Add(jsonutils.NewString(args.Sn), "sn")
 		}
 		if params.Size() == 0 {
 			return fmt.Errorf("Not data to update")

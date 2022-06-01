@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
@@ -41,6 +43,8 @@ type SBucket struct {
 	CreationDate time.Time
 	StorageClass string
 
+	ExtranetEndpoint string
+	IntranetEndpoint string
 	DepartmentInfo
 }
 
@@ -52,9 +56,13 @@ func (b *SBucket) GetName() string {
 	return b.Name
 }
 
+func (self *SBucket) GetOssClient() (*oss.Client, error) {
+	return self.region.GetOssClient()
+}
+
 func (b *SBucket) GetAcl() cloudprovider.TBucketACLType {
 	acl := cloudprovider.ACLPrivate
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		log.Errorf("b.region.GetOssClient fail %s", err)
 		return acl
@@ -87,25 +95,98 @@ func (b *SBucket) GetStorageClass() string {
 func (b *SBucket) GetAccessUrls() []cloudprovider.SBucketAccessUrl {
 	return []cloudprovider.SBucketAccessUrl{
 		{
-			Url:         fmt.Sprintf("%s.%s", b.Name, b.region.client.endpoints.OssEndpoint),
+			Url:         fmt.Sprintf("%s.%s", b.Name, b.ExtranetEndpoint),
 			Description: "ExtranetEndpoint",
 			Primary:     true,
 		},
 	}
 }
 
-func (b *SBucket) GetStats() cloudprovider.SBucketStats {
-	stats, err := cloudprovider.GetIBucketStats(b)
-	if err != nil {
-		log.Errorf("GetStats fail %s", err)
+func (self *SRegion) GetBucketSize(bucket string, department int) (int64, error) {
+	params := map[string]string{
+		"Namespace":  "acs_oss_dashboard",
+		"MetricName": "MeteringStorageUtilization",
+		"Period":     "3600",
+		"Dimensions": jsonutils.Marshal([]map[string]string{
+			{"BucketName": bucket},
+		}).String(),
+		"Department": fmt.Sprintf("%d", department),
+		"StartTime":  strconv.FormatInt(time.Now().Add(time.Hour*-24*2).Unix()*1000, 10),
+		"EndTime":    strconv.FormatInt(time.Now().Unix()*1000, 10),
 	}
-	return stats
+	resp, err := self.metricsRequest("DescribeMetricList", params)
+	if err != nil {
+		return 0, nil
+	}
+	datapoints, err := resp.GetString("Datapoints")
+	if err != nil {
+		return 0, errors.Wrapf(err, "get datapoints")
+	}
+	obj, err := jsonutils.ParseString(datapoints)
+	if err != nil {
+		return 0, errors.Wrapf(err, "ParseString")
+	}
+	data := []struct {
+		Timestamp int64
+		Value     int64
+	}{}
+	obj.Unmarshal(&data)
+	for i := range data {
+		return data[i].Value, nil
+	}
+	return 0, fmt.Errorf("no storage metric found")
+}
+
+func (b *SBucket) GetStats() cloudprovider.SBucketStats {
+	ret := cloudprovider.SBucketStats{
+		SizeBytes:   -1,
+		ObjectCount: -1,
+	}
+	dep, _ := strconv.Atoi(b.Department)
+	size, _ := b.region.GetBucketSize(b.Name, dep)
+	if size > 0 {
+		ret.SizeBytes = size
+	}
+	return ret
+}
+
+func (self *SRegion) GetBucketCapacity(bucket string, department int) (int64, error) {
+	params := map[string]string{
+		"Params": jsonutils.Marshal(map[string]string{
+			"BucketName": bucket,
+			"region":     self.RegionId,
+		}).String(),
+		// 此参数必传，可以设任意值
+		"AccountInfo": "aaa",
+		"Department":  fmt.Sprintf("%d", department),
+	}
+	resp, err := self.ossRequest("GetBucketStorageCapacity", params)
+	if err != nil {
+		return 0, errors.Wrapf(err, "GetBucketStorageCapacity")
+	}
+	return resp.Int("Data", "BucketUserQos", "StorageCapacity")
+}
+
+func (b *SBucket) GetLimit() cloudprovider.SBucketStats {
+	ret := cloudprovider.SBucketStats{
+		SizeBytes:   -1,
+		ObjectCount: -1,
+	}
+	dep, _ := strconv.Atoi(b.Department)
+	capa, _ := b.region.GetBucketCapacity(b.Name, dep)
+	if capa > 0 {
+		ret.SizeBytes = capa * 1024 * 1024 * 1024 * 1024
+	}
+	return ret
+}
+
+func (b *SBucket) LimitSupport() cloudprovider.SBucketStats {
+	return b.GetLimit()
 }
 
 func (b *SBucket) SetAcl(aclStr cloudprovider.TBucketACLType) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
-		log.Errorf("b.region.GetOssClient fail %s", err)
 		return errors.Wrap(err, "b.region.GetOssClient")
 	}
 	acl, err := str2Acl(string(aclStr))
@@ -121,7 +202,7 @@ func (b *SBucket) SetAcl(aclStr cloudprovider.TBucketACLType) error {
 
 func (b *SBucket) ListObjects(prefix string, marker string, delimiter string, maxCount int) (cloudprovider.SListObjectResult, error) {
 	result := cloudprovider.SListObjectResult{}
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return result, errors.Wrap(err, "GetOssClient")
 	}
@@ -200,7 +281,7 @@ func metaOpts(opts []oss.Option, meta http.Header) []oss.Option {
 }
 
 func (b *SBucket) PutObject(ctx context.Context, key string, input io.Reader, sizeBytes int64, cannedAcl cloudprovider.TBucketACLType, storageClassStr string, meta http.Header) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
 	}
@@ -234,7 +315,7 @@ func (b *SBucket) PutObject(ctx context.Context, key string, input io.Reader, si
 }
 
 func (b *SBucket) NewMultipartUpload(ctx context.Context, key string, cannedAcl cloudprovider.TBucketACLType, storageClassStr string, meta http.Header) (string, error) {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return "", errors.Wrap(err, "GetOssClient")
 	}
@@ -269,7 +350,7 @@ func (b *SBucket) NewMultipartUpload(ctx context.Context, key string, cannedAcl 
 }
 
 func (b *SBucket) UploadPart(ctx context.Context, key string, uploadId string, partIndex int, input io.Reader, partSize int64, offset, totalSize int64) (string, error) {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return "", errors.Wrap(err, "GetOssClient")
 	}
@@ -293,7 +374,7 @@ func (b *SBucket) UploadPart(ctx context.Context, key string, uploadId string, p
 }
 
 func (b *SBucket) CompleteMultipartUpload(ctx context.Context, key string, uploadId string, partEtags []string) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
 	}
@@ -324,7 +405,7 @@ func (b *SBucket) CompleteMultipartUpload(ctx context.Context, key string, uploa
 }
 
 func (b *SBucket) AbortMultipartUpload(ctx context.Context, key string, uploadId string) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
 	}
@@ -345,7 +426,7 @@ func (b *SBucket) AbortMultipartUpload(ctx context.Context, key string, uploadId
 }
 
 func (b *SBucket) DeleteObject(ctx context.Context, key string) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
 	}
@@ -364,7 +445,7 @@ func (b *SBucket) GetTempUrl(method string, key string, expire time.Duration) (s
 	if method != "GET" && method != "PUT" && method != "DELETE" {
 		return "", errors.Error("unsupported method")
 	}
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return "", errors.Wrap(err, "GetOssClient")
 	}
@@ -380,7 +461,7 @@ func (b *SBucket) GetTempUrl(method string, key string, expire time.Duration) (s
 }
 
 func (b *SBucket) CopyObject(ctx context.Context, destKey string, srcBucket, srcKey string, cannedAcl cloudprovider.TBucketACLType, storageClassStr string, meta http.Header) error {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
 	}
@@ -415,7 +496,7 @@ func (b *SBucket) CopyObject(ctx context.Context, destKey string, srcBucket, src
 }
 
 func (b *SBucket) GetObject(ctx context.Context, key string, rangeOpt *cloudprovider.SGetObjectRange) (io.ReadCloser, error) {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return nil, errors.Wrap(err, "GetOssClient")
 	}
@@ -435,7 +516,7 @@ func (b *SBucket) GetObject(ctx context.Context, key string, rangeOpt *cloudprov
 }
 
 func (b *SBucket) CopyPart(ctx context.Context, key string, uploadId string, partNumber int, srcBucket string, srcKey string, srcOffset int64, srcLength int64) (string, error) {
-	osscli, err := b.region.GetOssClient()
+	osscli, err := b.GetOssClient()
 	if err != nil {
 		return "", errors.Wrap(err, "GetOssClient")
 	}

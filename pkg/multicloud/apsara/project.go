@@ -26,10 +26,11 @@ import (
 )
 
 type DepartmentInfo struct {
-	Department      string
-	DepartmentName  string
-	ResourceGroup   string
-	ResourceGroupId string
+	Department        string
+	DepartmentName    string
+	ResourceGroup     string
+	ResourceGroupName string
+	ResourceGroupId   string
 }
 
 func (self DepartmentInfo) GetProjectId() string {
@@ -37,7 +38,7 @@ func (self DepartmentInfo) GetProjectId() string {
 }
 
 type SResourceGroup struct {
-	multicloud.SResourceBase
+	multicloud.SProjectBase
 	multicloud.ApsaraTags
 	client *SApsaraClient
 

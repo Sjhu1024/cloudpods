@@ -40,6 +40,8 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/consts"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
+	"yunion.io/x/onecloud/pkg/util/qemuimg"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
 	"yunion.io/x/onecloud/pkg/util/sysutils"
 	"yunion.io/x/onecloud/pkg/util/winutils"
 )
@@ -47,6 +49,22 @@ import (
 type DeployerServer struct{}
 
 var _ deployapi.DeployAgentServer = &DeployerServer{}
+
+func apiDiskInfo(req *deployapi.DiskInfo) qemuimg.SImageInfo {
+	if req == nil {
+		return qemuimg.SImageInfo{}
+	}
+	info := qemuimg.SImageInfo{
+		Path: req.GetPath(),
+	}
+	passwd := req.GetEncryptPassword()
+	if len(passwd) > 0 {
+		info.Password = passwd
+		info.EncryptFormat = qemuimg.TEncryptFormat(req.GetEncryptFormat())
+		info.EncryptAlg = seclib2.TSymEncAlg(req.GetEncryptAlg())
+	}
+	return info
+}
 
 func (*DeployerServer) DeployGuestFs(ctx context.Context, req *deployapi.DeployParams,
 ) (res *deployapi.DeployGuestFsResponse, err error) {
@@ -62,27 +80,35 @@ func (*DeployerServer) DeployGuestFs(ctx context.Context, req *deployapi.DeployP
 			res, err = nil, errors.Error(msg)
 		}
 	}()
-	log.Infof("********* Deploy guest fs on %s", req.DiskPath)
-	var disk = diskutils.GetIDisk(diskutils.DiskParams{
+	log.Infof("********* Deploy guest fs on %#v", apiDiskInfo(req.DiskInfo))
+	disk, err := diskutils.GetIDisk(diskutils.DiskParams{
 		Hypervisor: req.GuestDesc.Hypervisor,
-		DiskPath:   req.DiskPath,
+		DiskInfo:   apiDiskInfo(req.GetDiskInfo()),
 		VddkInfo:   req.VddkInfo,
-	}, DeployOption.ImageDeployDriver)
+	}, DeployOption.ImageDeployDriver, false)
+	if err != nil {
+		log.Errorf("diskutils.GetIDisk fail %s", err)
+		return new(deployapi.DeployGuestFsResponse), errors.Wrap(err, "GetIDisk")
+	}
+	defer disk.Cleanup()
 	if len(req.GuestDesc.Hypervisor) == 0 {
 		req.GuestDesc.Hypervisor = comapi.HYPERVISOR_KVM
 	}
-	defer disk.Disconnect()
 	if err := disk.Connect(); err != nil {
-		log.Infof("Failed to connect %s disk: %s", req.GuestDesc.Hypervisor, err)
-		return new(deployapi.DeployGuestFsResponse), nil
+		log.Errorf("Failed to connect %s disk: %s", req.GuestDesc.Hypervisor, err)
+		return new(deployapi.DeployGuestFsResponse), errors.Wrap(err, "Connect")
 	}
-	root := disk.MountRootfs()
+	defer disk.Disconnect()
+	root, err := disk.MountRootfs()
+	if err != nil {
+		if errors.Cause(err) == errors.ErrNotFound && req.DeployInfo.IsInit {
+			// if init deploy, ignore no partition error
+			return new(deployapi.DeployGuestFsResponse), nil
+		}
+		log.Errorf("Failed mounting rootfs for %s disk: %s", req.GuestDesc.Hypervisor, err)
+		return new(deployapi.DeployGuestFsResponse), err
+	}
 	defer disk.UmountRootfs(root)
-	if root == nil {
-		log.Infof("Failed mounting rootfs for %s disk", req.GuestDesc.Hypervisor)
-		return new(deployapi.DeployGuestFsResponse), nil
-	}
-
 	ret, err := guestfs.DoDeployGuestFs(root, req.GuestDesc, req.DeployInfo)
 	if err != nil {
 		return new(deployapi.DeployGuestFsResponse), err
@@ -105,104 +131,134 @@ func (*DeployerServer) ResizeFs(ctx context.Context, req *deployapi.ResizeFsPara
 			res, err = nil, errors.Error(msg)
 		}
 	}()
-	log.Infof("********* Resize fs on %s", req.DiskPath)
-	var disk = diskutils.GetIDisk(diskutils.DiskParams{
+	log.Infof("********* Resize fs on %#v", apiDiskInfo(req.DiskInfo))
+	disk, err := diskutils.GetIDisk(diskutils.DiskParams{
 		Hypervisor: req.Hypervisor,
-		DiskPath:   req.DiskPath,
+		DiskInfo:   apiDiskInfo(req.GetDiskInfo()),
 		VddkInfo:   req.VddkInfo,
-	}, DeployOption.ImageDeployDriver)
-	defer disk.Disconnect()
+	}, DeployOption.ImageDeployDriver, false)
+	if err != nil {
+		return new(deployapi.Empty), errors.Wrap(err, "GetIDisk fail")
+	}
+	defer disk.Cleanup()
 	if err := disk.Connect(); err != nil {
 		return new(deployapi.Empty), errors.Wrap(err, "disk connect failed")
 	}
+	defer disk.Disconnect()
 
 	unmount := func(root fsdriver.IRootFsDriver) error {
-		if err := disk.UmountRootfs(root); err != nil {
+		err := disk.UmountRootfs(root)
+		if err != nil {
 			return errors.Wrap(err, "unmount rootfs")
 		}
 		return nil
 	}
 
-	root := disk.MountRootfs()
-	if root != nil && !root.IsResizeFsPartitionSupport() {
-		if err := unmount(root); err != nil {
+	root, err := disk.MountRootfs()
+	if err != nil {
+		if errors.Cause(err) == errors.ErrNotFound {
+			return new(deployapi.Empty), nil
+		}
+		return new(deployapi.Empty), errors.Wrapf(err, "disk.MountRootfs")
+	}
+	if !root.IsResizeFsPartitionSupport() {
+		err := unmount(root)
+		if err != nil {
 			return new(deployapi.Empty), err
 		}
 		return new(deployapi.Empty), errors.ErrNotSupported
 	}
 
 	// must umount rootfs before resize partition
-	if err := unmount(root); err != nil {
+	err = unmount(root)
+	if err != nil {
 		return new(deployapi.Empty), err
 	}
-	if err := disk.ResizePartition(); err != nil {
+	err = disk.ResizePartition()
+	if err != nil {
 		return new(deployapi.Empty), errors.Wrap(err, "resize disk partition")
 	}
 	return new(deployapi.Empty), nil
 }
 
 func (*DeployerServer) FormatFs(ctx context.Context, req *deployapi.FormatFsParams) (*deployapi.Empty, error) {
-	log.Infof("********* Format fs on %s", req.DiskPath)
-	gd := diskutils.NewKVMGuestDisk(req.DiskPath, DeployOption.ImageDeployDriver)
-	defer gd.Disconnect()
+	log.Infof("********* Format fs on %#v", apiDiskInfo(req.DiskInfo))
+	gd, err := diskutils.NewKVMGuestDisk(apiDiskInfo(req.GetDiskInfo()), DeployOption.ImageDeployDriver, false)
+	if err != nil {
+		return new(deployapi.Empty), errors.Wrap(err, "NewKVMGuestDisk")
+	}
+	defer gd.Cleanup()
+
 	if err := gd.Connect(); err == nil {
+		defer gd.Disconnect()
 		if err := gd.MakePartition(req.FsFormat); err == nil {
 			err = gd.FormatPartition(req.FsFormat, req.Uuid)
 			if err != nil {
-				return new(deployapi.Empty), err
+				return new(deployapi.Empty), errors.Wrap(err, "FormatPartition")
 			}
 		} else {
-			return new(deployapi.Empty), err
+			return new(deployapi.Empty), errors.Wrap(err, "MakePartition")
 		}
 	} else {
-		log.Errorf("failed connect kvm disk %s: %s", req.DiskPath, err)
+		log.Errorf("failed connect kvm disk %#v: %s", apiDiskInfo(req.DiskInfo), err)
 	}
 	return new(deployapi.Empty), nil
 }
 
 func (*DeployerServer) SaveToGlance(ctx context.Context, req *deployapi.SaveToGlanceParams) (*deployapi.SaveToGlanceResponse, error) {
-	log.Infof("********* %s save to glance", req.DiskPath)
+	log.Infof("********* %#v save to glance", apiDiskInfo(req.DiskInfo))
 	var (
-		kvmDisk = diskutils.NewKVMGuestDisk(req.DiskPath, DeployOption.ImageDeployDriver)
 		osInfo  string
 		relInfo *deployapi.ReleaseInfo
 	)
-	defer kvmDisk.Disconnect()
-	if err := kvmDisk.Connect(); err != nil {
-		log.Errorf("failed connect kvm disk %s: %s", req.DiskPath, err)
-	} else {
-		var err error
-		func() {
-			if root := kvmDisk.MountKvmRootfs(); root != nil {
-				defer kvmDisk.UmountKvmRootfs(root)
-
-				osInfo = root.GetOs()
-				relInfo = root.GetReleaseInfo(root.GetPartition())
-				if req.Compress {
-					err = root.PrepareFsForTemplate(root.GetPartition())
-				}
-			}
-		}()
-		if err != nil {
-			log.Errorln(err)
-			return new(deployapi.SaveToGlanceResponse), err
-		}
-
-		if req.Compress {
-			kvmDisk.Zerofree()
-		}
+	kvmDisk, err := diskutils.NewKVMGuestDisk(apiDiskInfo(req.GetDiskInfo()), DeployOption.ImageDeployDriver, false)
+	if err != nil {
+		return new(deployapi.SaveToGlanceResponse), errors.Wrap(err, "NewKVMGuestDisk")
 	}
-	return &deployapi.SaveToGlanceResponse{
+	defer kvmDisk.Cleanup()
+
+	ret := &deployapi.SaveToGlanceResponse{
 		OsInfo:      osInfo,
 		ReleaseInfo: relInfo,
-	}, nil
+	}
+
+	err = kvmDisk.Connect()
+	if err != nil {
+		return ret, errors.Wrapf(err, "kvmDisk.Connect %#v", apiDiskInfo(req.DiskInfo))
+	}
+	defer kvmDisk.Disconnect()
+
+	root, err := kvmDisk.MountKvmRootfs()
+	if err != nil {
+		if errors.Cause(err) == errors.ErrNotFound {
+			return ret, nil
+		}
+		return ret, errors.Wrapf(err, "MountKvmRootfs")
+	}
+	defer kvmDisk.UmountKvmRootfs(root)
+
+	osInfo = root.GetOs()
+	relInfo = root.GetReleaseInfo(root.GetPartition())
+	if req.Compress {
+		err = root.PrepareFsForTemplate(root.GetPartition())
+		if err != nil {
+			log.Errorf("PrepareFsForTemplate %s", err)
+		}
+	}
+	if req.Compress {
+		kvmDisk.Zerofree()
+	}
+	return ret, err
 }
 
 func (*DeployerServer) getImageInfo(kvmDisk *diskutils.SKVMGuestDisk) (*deployapi.ImageInfo, error) {
 	// Fsck is executed during mount
-	rootfs := kvmDisk.MountKvmRootfs()
-	if rootfs == nil {
-		return new(deployapi.ImageInfo), fmt.Errorf("Failed mounting rootfs for kvm disk")
+	rootfs, err := kvmDisk.MountKvmRootfs()
+	if err != nil {
+		if errors.Cause(err) == errors.ErrNotFound {
+			return new(deployapi.ImageInfo), nil
+		}
+		return new(deployapi.ImageInfo), errors.Wrapf(err, "kvmDisk.MountKvmRootfs")
 	}
 	partition := rootfs.GetPartition()
 	imageInfo := &deployapi.ImageInfo{
@@ -223,13 +279,18 @@ func (*DeployerServer) getImageInfo(kvmDisk *diskutils.SKVMGuestDisk) (*deployap
 }
 
 func (s *DeployerServer) ProbeImageInfo(ctx context.Context, req *deployapi.ProbeImageInfoPramas) (*deployapi.ImageInfo, error) {
-	log.Infof("********* %s probe image info", req.DiskPath)
-	kvmDisk := diskutils.NewKVMGuestDisk(req.DiskPath, DeployOption.ImageDeployDriver)
-	defer kvmDisk.Disconnect()
-	if err := kvmDisk.Connect(); err != nil {
-		log.Infof("Failed to connect kvm disk %s: %s", req.DiskPath, err)
-		return new(deployapi.ImageInfo), errors.Error("Disk connector failed to connect image")
+	log.Infof("********* %#v probe image info", apiDiskInfo(req.DiskInfo))
+	kvmDisk, err := diskutils.NewKVMGuestDisk(apiDiskInfo(req.GetDiskInfo()), DeployOption.ImageDeployDriver, true)
+	if err != nil {
+		return new(deployapi.ImageInfo), errors.Wrap(err, "NewKVMGuestDisk")
 	}
+	defer kvmDisk.Cleanup()
+
+	if err := kvmDisk.Connect(); err != nil {
+		log.Errorf("Failed to connect kvm disk %#v: %s", apiDiskInfo(req.DiskInfo), err)
+		return new(deployapi.ImageInfo), errors.Wrap(err, "Disk connector failed to connect image")
+	}
+	defer kvmDisk.Disconnect()
 
 	return s.getImageInfo(kvmDisk)
 }
@@ -247,7 +308,7 @@ func (*DeployerServer) ConnectEsxiDisks(
 	)
 	ret.Disks = make([]*deployapi.EsxiDiskInfo, len(req.AccessInfo))
 	for i := 0; i < len(req.AccessInfo); i++ {
-		disk := diskutils.NewVDDKDisk(req.VddkInfo, req.AccessInfo[i].DiskPath, DeployOption.ImageDeployDriver)
+		disk, _ := diskutils.NewVDDKDisk(req.VddkInfo, req.AccessInfo[i].DiskPath, DeployOption.ImageDeployDriver, false)
 		flatFilePath, err = disk.ConnectBlockDevice()
 		if err != nil {
 			err = errors.Wrapf(err, "disk %s connect block device", req.AccessInfo[i].DiskPath)

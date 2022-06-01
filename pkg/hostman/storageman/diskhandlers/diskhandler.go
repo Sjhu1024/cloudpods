@@ -32,6 +32,7 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 )
 
@@ -52,7 +53,7 @@ var (
 	}
 )
 
-type actionFunc func(context.Context, storageman.IStorage, string, storageman.IDisk, jsonutils.JSONObject) (interface{}, error)
+type actionFunc func(context.Context, mcclient.TokenCredential, storageman.IStorage, string, storageman.IDisk, jsonutils.JSONObject) (interface{}, error)
 
 func AddDiskHandler(prefix string, app *appsrv.Application) {
 	for _, keyWord := range keyWords {
@@ -189,6 +190,7 @@ func getSnapshotStatus(ctx context.Context, w http.ResponseWriter, r *http.Reque
 
 func saveToGlance(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	params, _, body := appsrv.FetchEnv(ctx, w, r)
+	userCred := auth.FetchUserCredential(ctx, nil)
 	var (
 		storageId   = params["<storageId>"]
 		diskInfo, _ = body.Get("disk")
@@ -202,13 +204,18 @@ func saveToGlance(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("disk"))
 		return
 	}
+	info := storageman.SStorageSaveToGlanceInfo{
+		UserCred: userCred,
+		DiskInfo: diskInfo.(*jsonutils.JSONDict),
+	}
 
-	hostutils.DelayTaskWithoutReqctx(ctx, storage.SaveToGlance, diskInfo)
+	hostutils.DelayTaskWithoutReqctx(ctx, storage.SaveToGlance, info)
 	hostutils.ResponseOk(ctx, w)
 }
 
 func performDiskActions(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	params, _, body := appsrv.FetchEnv(ctx, w, r)
+	userCred := auth.FetchUserCredential(ctx, nil)
 	if body == nil {
 		body = jsonutils.NewDict()
 	}
@@ -245,7 +252,7 @@ func performDiskActions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		hostutils.Response(ctx, w, httperrors.NewNotFoundError("Action %s Not found", action))
 		return
 	}
-	res, err := f(ctx, storage, diskId, disk, body)
+	res, err := f(ctx, userCred, storage, diskId, disk, body)
 	if err != nil {
 		hostutils.Response(ctx, w, err)
 		return
@@ -257,7 +264,7 @@ func performDiskActions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	hostutils.ResponseOk(ctx, w)
 }
 
-func diskCreate(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskCreate(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	params := storageman.SDiskCreateByDiskinfo{
 		DiskId:   diskId,
 		Disk:     disk,
@@ -272,16 +279,16 @@ func diskCreate(ctx context.Context, storage storageman.IStorage, diskId string,
 	return nil, nil
 }
 
-func diskDelete(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskDelete(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	if disk != nil {
-		hostutils.DelayTask(ctx, disk.Delete, nil)
+		hostutils.DelayTask(ctx, disk.Delete, compute.DiskDeleteInput{})
 	} else {
 		hostutils.DelayTask(ctx, nil, nil)
 	}
 	return nil, nil
 }
 
-func diskResize(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskResize(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	diskInfo, err := body.Get("disk")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("disk")
@@ -296,7 +303,7 @@ func diskResize(ctx context.Context, storage storageman.IStorage, diskId string,
 	}
 }
 
-func diskSavePrepare(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskSavePrepare(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	diskInfo, err := body.Get("disk")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("disk")
@@ -305,19 +312,21 @@ func diskSavePrepare(ctx context.Context, storage storageman.IStorage, diskId st
 	return nil, nil
 }
 
-func diskReset(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskReset(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	snapshotId, err := body.GetString("snapshot_id")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("snapshot_id")
 	}
+	backingDiskId, _ := body.GetString("backing_disk_id")
 	hostutils.DelayTask(ctx, disk.ResetFromSnapshot, &storageman.SDiskReset{
-		SnapshotId: snapshotId,
-		Input:      body,
+		SnapshotId:    snapshotId,
+		BackingDiskId: backingDiskId,
+		Input:         body,
 	})
 	return nil, nil
 }
 
-func diskSnapshot(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskSnapshot(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	snapshotId, err := body.GetString("snapshot_id")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("snapshot_id")
@@ -368,33 +377,27 @@ func diskStorageBackupRecovery(ctx context.Context, storage storageman.IStorage,
 	return nil, nil
 }
 
-func diskBackup(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
-	snapshotId, err := body.GetString("snapshot_id")
+func diskBackup(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+	backupInfo := &storageman.SDiskBakcup{}
+	err := body.Unmarshal(backupInfo)
 	if err != nil {
+		return nil, errors.Wrap(err, "JsonUnmarshal")
+	}
+	if len(backupInfo.SnapshotId) == 0 {
 		return nil, httperrors.NewMissingParameterError("snapshot_id")
 	}
-	backupId, err := body.GetString("backup_id")
-	if err != nil {
+	if len(backupInfo.BackupId) == 0 {
 		return nil, httperrors.NewMissingParameterError("backup_id")
 	}
-	backupStorageId, err := body.GetString("backup_storage_id")
-	if err != nil {
+	if len(backupInfo.BackupStorageId) == 0 {
 		return nil, httperrors.NewMissingParameterError("backup_storage_id")
 	}
-	backupStorageAccessInfo, err := body.Get("backup_storage_access_info")
-	if err != nil {
-		return nil, httperrors.NewMissingParameterError("backup_storage_access_info")
-	}
-	hostutils.DelayTask(ctx, disk.DiskBackup, &storageman.SDiskBakcup{
-		BackupId:                backupId,
-		SnapshotId:              snapshotId,
-		BackupStorageId:         backupStorageId,
-		BackupStorageAccessInfo: backupStorageAccessInfo.(*jsonutils.JSONDict),
-	})
+	backupInfo.UserCred = userCred
+	hostutils.DelayTask(ctx, disk.DiskBackup, backupInfo)
 	return nil, nil
 }
 
-func diskDeleteSnapshot(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskDeleteSnapshot(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	snapshotId, err := body.GetString("snapshot_id")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("snapshot_id")
@@ -403,7 +406,7 @@ func diskDeleteSnapshot(ctx context.Context, storage storageman.IStorage, diskId
 	return nil, nil
 }
 
-func diskCleanupSnapshots(ctx context.Context, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
+func diskCleanupSnapshots(ctx context.Context, userCred mcclient.TokenCredential, storage storageman.IStorage, diskId string, disk storageman.IDisk, body jsonutils.JSONObject) (interface{}, error) {
 	convertSnapshots, err := body.GetArray("convert_snapshots")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("convert_snapshots")

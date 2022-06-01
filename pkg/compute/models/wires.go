@@ -1099,12 +1099,12 @@ func (wire *SWire) clearHostSchedDescCache() error {
 	return nil
 }
 
-func (self *SWire) GetIWire() (cloudprovider.ICloudWire, error) {
+func (self *SWire) GetIWire(ctx context.Context) (cloudprovider.ICloudWire, error) {
 	vpc, err := self.GetVpc()
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetVpc")
 	}
-	ivpc, err := vpc.GetIVpc()
+	ivpc, err := vpc.GetIVpc(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1280,6 +1280,23 @@ func (wm *SWireManager) handleWireIdChange(ctx context.Context, args *wireIdChan
 	return nil
 }
 
+func (wire *SWire) PerformSetClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetClassMetadataInput) (jsonutils.JSONObject, error) {
+	vpc, err := wire.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to get vpc of wire %s", wire.GetId())
+	}
+	if vpc.GetId() != api.DEFAULT_VPC_ID {
+		ok, err := db.IsInSameClass(ctx, vpc, db.ClassMetadataOwner(input))
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to check if vpc and wire are in same class")
+		}
+		if !ok {
+			return nil, httperrors.NewForbiddenError("the vpc %s and this wire have different class metadata", vpc.GetName())
+		}
+	}
+	return wire.SStatusInfrasResourceBase.PerformSetClassMetadata(ctx, userCred, query, input)
+}
+
 // 二层网络列表
 func (manager *SWireManager) ListItemFilter(
 	ctx context.Context,
@@ -1448,6 +1465,18 @@ func (model *SWire) CustomizeCreate(ctx context.Context, userCred mcclient.Token
 	return model.SInfrasResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 
+func (model *SWire) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
+	model.SStatusInfrasResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	vpc, err := model.GetVpc()
+	if err != nil {
+		log.Errorf("unable to getvpc of wire %s: %s", model.GetId(), vpc.GetId())
+	}
+	err = db.InheritFromTo(ctx, vpc, model)
+	if err != nil {
+		log.Errorf("unable to inhert vpc to model %s: %s", model.GetId(), err.Error())
+	}
+}
+
 func (wire *SWire) GetChangeOwnerCandidateDomainIds() []string {
 	candidates := [][]string{}
 	vpc, _ := wire.GetVpc()
@@ -1525,6 +1554,7 @@ func (self *SWire) GetDetailsTopology(ctx context.Context, userCred mcclient.Tok
 	}
 	for i := range hosts {
 		hns := hosts[i].GetBaremetalnetworks()
+		hss := hosts[i]._getAttachedStorages(tristate.None, tristate.None, nil)
 		host := api.HostTopologyOutput{
 			Name:       hosts[i].Name,
 			Id:         hosts[i].Id,
@@ -1532,11 +1562,22 @@ func (self *SWire) GetDetailsTopology(ctx context.Context, userCred mcclient.Tok
 			HostStatus: hosts[i].HostStatus,
 			HostType:   hosts[i].HostType,
 			Networks:   []api.HostnetworkTopologyOutput{},
+			Schedtags:  GetSchedtagsDetailsToResourceV2(&hosts[i], ctx),
 		}
 		for j := range hns {
 			host.Networks = append(host.Networks, api.HostnetworkTopologyOutput{
 				IpAddr:  hns[j].IpAddr,
 				MacAddr: hns[j].MacAddr,
+			})
+		}
+		for j := range hss {
+			host.Storages = append(host.Storages, api.StorageShortDesc{
+				Name:        hss[j].Name,
+				Id:          hss[j].Id,
+				Status:      hss[j].Status,
+				Enabled:     hss[j].Enabled.Bool(),
+				StorageType: hss[j].StorageType,
+				CapacityMb:  hss[j].Capacity,
 			})
 		}
 		ret.Hosts = append(ret.Hosts, host)

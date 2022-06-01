@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/jsonutils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/mcclient"
 )
 
 type SDiskCreateByDiskinfo struct {
@@ -35,8 +36,9 @@ func (i *SDiskCreateByDiskinfo) String() string {
 }
 
 type SDiskReset struct {
-	SnapshotId string
-	Input      jsonutils.JSONObject
+	SnapshotId    string
+	BackingDiskId string
+	Input         jsonutils.JSONObject
 }
 
 type SDiskCleanupSnapshots struct {
@@ -45,14 +47,46 @@ type SDiskCleanupSnapshots struct {
 }
 
 type SDiskBakcup struct {
-	SnapshotId              string
-	BackupId                string
-	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
+	SnapshotId              string              `json:"snapshot_id"`
+	BackupId                string              `json:"backup_id"`
+	BackupStorageId         string              `json:"backup_storage_id"`
+	BackupStorageAccessInfo *jsonutils.JSONDict `json:"backup_storage_access_info"`
+
+	EncryptKeyId string `json:"encrypt_key_id"`
+
+	UserCred mcclient.TokenCredential
 }
 
 type SStorageBackup struct {
 	BackupId                string
 	BackupStorageId         string
 	BackupStorageAccessInfo *jsonutils.JSONDict
+}
+
+type SStoragePackBackup struct {
+	PackageName             string
+	BackupId                string
+	BackupStorageId         string
+	BackupStorageAccessInfo *jsonutils.JSONDict
+	Metadata                api.DiskBackupPackMetadata
+}
+
+type SStoragePackInstanceBackup struct {
+	PackageName             string
+	BackupStorageId         string
+	BackupStorageAccessInfo *jsonutils.JSONDict
+	BackupIds               []string
+	Metadata                api.InstanceBackupPackMetadata
+}
+
+type SStorageUnpackInstanceBackup struct {
+	PackageName             string
+	BackupStorageId         string
+	BackupStorageAccessInfo *jsonutils.JSONDict
+	MetadataOnly            *bool
+}
+
+type SStorageSaveToGlanceInfo struct {
+	UserCred mcclient.TokenCredential
+	DiskInfo *jsonutils.JSONDict
 }

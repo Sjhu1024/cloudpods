@@ -49,6 +49,7 @@ func init() {
 	cmd.CreateWithKeyword("create-jdcloud", &options.SJDcloudCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-cloudpods", &options.SCloudpodsCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-nutanix", &options.SNutanixCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-bingocloud", &options.SBingoCloudAccountCreateOptions{})
 
 	cmd.UpdateWithKeyword("update-vmware", &options.SVMwareCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-aliyun", &options.SAliyunCloudAccountUpdateOptions{})
@@ -66,6 +67,7 @@ func init() {
 	cmd.UpdateWithKeyword("update-jdcloud", &options.SJDcloudCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-cloudpods", &options.SCloudpodsCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-nutanix", &options.SNutanixCloudAccountUpdateOptions{})
+	cmd.UpdateWithKeyword("update-bingocloud", &options.SBingoCloudAccountUpdateOptions{})
 
 	cmd.Perform("update-credential", &options.CloudaccountUpdateCredentialOptions{})
 
@@ -77,6 +79,7 @@ func init() {
 	cmd.PerformWithKeyword("update-credential-aws", "update-credential", &options.SAWSCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-openstack", "update-credential", &options.SOpenStackCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-huawei", "update-credential", &options.SHuaweiCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("update-credential-apsara", "update-credential", &options.SApsaraCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-hcso", "update-credential", &options.SHCSOAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-ucloud", "update-credential", &options.SUcloudCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-zstack", "update-credential", &options.SZStackCloudAccountUpdateCredentialOptions{})
@@ -85,6 +88,7 @@ func init() {
 	cmd.PerformWithKeyword("update-credential-jdcloud", "update-credential", &options.SJDcloudCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-cloudpods", "update-credential", &options.SCloudpodsCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-nutanix", "update-credential", &options.SNutanixCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("update-credential-bingocloud", "update-credential", &options.SBingoCloudAccountUpdateCredentialOptions{})
 
 	cmd.PerformWithKeyword("test-connectivity-google", "test-connectivity", &options.SGoogleCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-vmware", "test-connectivity", &options.SVMwareCloudAccountUpdateCredentialOptions{})

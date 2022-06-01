@@ -102,6 +102,9 @@ type DiskConfig struct {
 	// required: false
 	ImageId string `json:"image_id"`
 
+	// 镜像加密key ID
+	ImageEncryptKeyId string `json:"image_encrypt_key_id"`
+
 	// 快照ID,通过快照创建磁盘,此参数必须加上 'snapshot-' 前缀
 	// example: snapshot-3140cecb-ccc4-4865-abae-3a5ba8c69d9b
 	// requried: false
@@ -299,6 +302,7 @@ type ServerConfigs struct {
 	// required: false
 	Backup bool `json:"backup"`
 
+	// swagger:ignore
 	// 创建虚拟机数量
 	// default: 1
 	Count int `json:"count"`
@@ -354,6 +358,8 @@ type ServerCreateInput struct {
 
 	*ServerConfigs
 
+	apis.EncryptedResourceCreateInput
+
 	// 虚拟机内存大小,单位Mb,若未指定instance_type,此参数为必传项
 	VmemSize int `json:"vmem_size"`
 
@@ -362,6 +368,7 @@ type ServerCreateInput struct {
 	VcpuCount int `json:"vcpu_count"`
 
 	// 用户自定义启动脚本
+	// 公有云私有云只支持 #cloud-config yaml 格式, 且只有linux系统生效
 	// required: false
 	UserData string `json:"user_data"`
 
@@ -563,18 +570,20 @@ type GuestBatchMigrateRequest struct {
 	PreferHostId string `json:"prefer_host_id"`
 	// Deprecated
 	// swagger:ignore
-	PreferHost   string `json:"prefer_host" yunion-deprecated-by:"prefer_host_id"`
-	SkipCpuCheck bool   `json:"skip_cpu_check"`
-	EnableTLS    *bool  `json:"enable_tls"`
+	PreferHost      string `json:"prefer_host" yunion-deprecated-by:"prefer_host_id"`
+	SkipCpuCheck    bool   `json:"skip_cpu_check"`
+	SkipKernelCheck bool   `json:"skip_kernel_check"`
+	EnableTLS       *bool  `json:"enable_tls"`
 }
 
 type GuestBatchMigrateParams struct {
-	Id           string
-	LiveMigrate  bool
-	SkipCpuCheck bool
-	EnableTLS    *bool
-	RescueMode   bool
-	OldStatus    string
+	Id              string
+	LiveMigrate     bool
+	SkipCpuCheck    bool
+	SkipKernelCheck bool
+	EnableTLS       *bool
+	RescueMode      bool
+	OldStatus       string
 }
 
 type HostLoginInfo struct {

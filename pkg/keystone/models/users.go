@@ -42,6 +42,7 @@ import (
 
 type SUserManager struct {
 	SEnabledIdentityBaseResourceManager
+	db.SRecordChecksumResourceBaseManager
 }
 
 var UserManager *SUserManager
@@ -54,6 +55,7 @@ func init() {
 			"user",
 			"users",
 		),
+		SRecordChecksumResourceBaseManager: *db.NewRecordChecksumResourceBaseManager(),
 	}
 	UserManager.SetVirtualObject(UserManager)
 	db.InitManager(func() {
@@ -76,26 +78,36 @@ func init() {
 */
 
 type SUser struct {
+	db.SRecordChecksumResourceBase
 	SEnabledIdentityBaseResource
 
-	Email  string `width:"64" charset:"utf8" nullable:"true" index:"true" list:"domain" update:"domain" create:"domain_optional"`
+	// 用户邮箱
+	Email string `width:"64" charset:"utf8" nullable:"true" index:"true" list:"domain" update:"domain" create:"domain_optional"`
+	// 用户手机号
 	Mobile string `width:"20" charset:"ascii" nullable:"true" index:"true" list:"domain" update:"domain" create:"domain_optional"`
 
+	// 显示名称，用户登录后显示在右上角菜单入口
 	Displayname string `with:"128" charset:"utf8" nullable:"true" list:"domain" update:"domain" create:"domain_optional"`
 
+	// 上次登录时间
 	LastActiveAt time.Time `nullable:"true" list:"domain"`
-
-	LastLoginIp     string `nullable:"true" list:"domain"`
+	// 上次用户登录IP
+	LastLoginIp string `nullable:"true" list:"domain"`
+	// 上次用户登录方式，可能值有：web（web控制台），cli（命令行climc），API（api）
 	LastLoginSource string `nullable:"true" list:"domain"`
 
-	IsSystemAccount tristate.TriState `nullable:"false" default:"false" list:"domain" update:"admin" create:"admin_optional"`
+	// 是否为系统账号，系统账号不会检查密码复杂度，默认不在列表显示
+	IsSystemAccount tristate.TriState `default:"false" list:"domain" update:"admin" create:"admin_optional"`
 
 	// deprecated
 	DefaultProjectId string `width:"64" charset:"ascii" nullable:"true"`
 
-	AllowWebConsole tristate.TriState `nullable:"false" default:"true" list:"domain" update:"domain" create:"domain_optional"`
-	EnableMfa       tristate.TriState `nullable:"false" default:"false" list:"domain" update:"domain" create:"domain_optional"`
+	// 是否允许登录Web控制台，如果是用于API访问的用户，可禁用web控制台登录
+	AllowWebConsole tristate.TriState `default:"true" list:"domain" update:"domain" create:"domain_optional"`
+	// 是否开启MFA
+	EnableMfa tristate.TriState `default:"false" list:"domain" update:"domain" create:"domain_optional"`
 
+	// 用户的默认语言设置，默认是zh_CN
 	Lang string `width:"8" charset:"ascii" nullable:"false" list:"domain" update:"domain" create:"domain_optional"`
 }
 
@@ -192,7 +204,7 @@ func (manager *SUserManager) initSysUser(ctx context.Context) error {
 			if err != nil {
 				return errors.Wrap(err, "ResetAdminUserPassword Query user")
 			}
-			err = usr.initLocalData(o.Options.BootstrapAdminUserPassword)
+			err = usr.initLocalData(o.Options.BootstrapAdminUserPassword, false)
 			if err != nil {
 				return errors.Wrap(err, "initLocalData")
 			}
@@ -218,7 +230,7 @@ func (manager *SUserManager) initSysUser(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "insert")
 	}
-	err = usr.initLocalData(o.Options.BootstrapAdminUserPassword)
+	err = usr.initLocalData(o.Options.BootstrapAdminUserPassword, false)
 	if err != nil {
 		return errors.Wrap(err, "initLocalData")
 	}
@@ -603,7 +615,7 @@ func (manager *SUserManager) FetchCustomizeColumns(
 			EnabledIdentityBaseResourceDetails: identRows[i],
 		}
 		userIds[i] = objs[i].(*SUser).Id
-		rows[i] = userExtra(objs[i].(*SUser), rows[i])
+		rows[i] = userExtra(ctx, userCred, objs[i].(*SUser), rows[i])
 	}
 
 	idpsMaps, err := fetchIdmappings(userIds, api.IdMappingEntityUser)
@@ -627,7 +639,7 @@ func (manager *SUserManager) FetchCustomizeColumns(
 	return rows
 }
 
-func userExtra(user *SUser, out api.UserDetails) api.UserDetails {
+func userExtra(ctx context.Context, userCred mcclient.TokenCredential, user *SUser, out api.UserDetails) api.UserDetails {
 	out.GroupCount, _ = user.GetGroupCount()
 	out.ProjectCount, _ = user.GetProjectCount()
 	out.CredentialCount, _ = user.GetCredentialCount()
@@ -637,6 +649,9 @@ func userExtra(user *SUser, out api.UserDetails) api.UserDetails {
 		if localUser.FailedAuthCount > 0 {
 			out.FailedAuthCount = localUser.FailedAuthCount
 			out.FailedAuthAt = localUser.FailedAuthAt
+		}
+		if localUser.NeedResetPassword.IsTrue() {
+			out.NeedResetPassword = true
 		}
 		localPass, _ := PasswordManager.FetchLastPassword(localUser.Id)
 		if localPass != nil && !localPass.ExpiresAt.IsZero() {
@@ -658,10 +673,20 @@ func userExtra(user *SUser, out api.UserDetails) api.UserDetails {
 		out.ExtResourcesNextUpdate = nextUpdate
 	}
 
+	projects, _ := ProjectManager.FetchUserProjects(user.Id)
+	out.Projects = make([]api.SFetchDomainObjectWithMetadata, len(projects))
+	for i, proj := range projects {
+		out.Projects[i].Id = proj.Id
+		out.Projects[i].Name = proj.Name
+		out.Projects[i].Domain = proj.DomainName
+		out.Projects[i].DomainId = proj.DomainId
+		out.Projects[i].Metadata, _ = proj.GetAllMetadata(ctx, userCred)
+	}
+
 	return out
 }
 
-func (user *SUser) initLocalData(passwd string) error {
+func (user *SUser) initLocalData(passwd string, skipPassCheck bool) error {
 	localUsr, err := LocalUserManager.register(user.Id, user.DomainId, user.Name)
 	if err != nil {
 		return errors.Wrap(err, "register localuser")
@@ -670,6 +695,11 @@ func (user *SUser) initLocalData(passwd string) error {
 		err = PasswordManager.savePassword(localUsr.Id, passwd, user.IsSystemAccount.Bool())
 		if err != nil {
 			return errors.Wrap(err, "save password")
+		}
+		if skipPassCheck {
+			localUsr.markNeedResetPassword(true)
+		} else {
+			localUsr.markNeedResetPassword(false)
 		}
 	}
 	return nil
@@ -680,7 +710,8 @@ func (user *SUser) PostCreate(ctx context.Context, userCred mcclient.TokenCreden
 
 	// set password
 	passwd, _ := data.GetString("password")
-	err := user.initLocalData(passwd)
+	skipPassCheck := jsonutils.QueryBoolean(data, "skip_password_complexity_check", false)
+	err := user.initLocalData(passwd, skipPassCheck)
 	if err != nil {
 		log.Errorf("fail to register localUser %s", err)
 		return
@@ -720,6 +751,17 @@ func (user *SUser) PostUpdate(ctx context.Context, userCred mcclient.TokenCreden
 		if err != nil {
 			log.Errorf("fail to set password %s", err)
 			return
+		}
+		localUsr, err := LocalUserManager.fetchLocalUser("", "", usrExt.LocalId)
+		if err != nil {
+			log.Errorf("Fail to fetch localUser %d: %s", usrExt.LocalId, err)
+		} else {
+			skipPassCheck := jsonutils.QueryBoolean(data, "skip_password_complexity_check", false)
+			if skipPassCheck {
+				localUsr.markNeedResetPassword(true)
+			} else {
+				localUsr.markNeedResetPassword(false)
+			}
 		}
 		logclient.AddActionLogWithContext(ctx, user, logclient.ACT_UPDATE_PASSWORD, nil, userCred, true)
 	}
@@ -947,14 +989,6 @@ func (user *SUser) UnlinkIdp(idpId string) error {
 	return IdmappingManager.deleteAny(idpId, api.IdMappingEntityUser, user.Id)
 }
 
-func (user *SUser) AllowPerformJoin(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.SJoinProjectsInput,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, user, "join")
-}
-
 // 用户加入项目
 func (user *SUser) PerformJoin(
 	ctx context.Context,
@@ -1024,14 +1058,6 @@ func joinProjects(ident db.IModel, isUser bool, ctx context.Context, userCred mc
 	}
 
 	return nil
-}
-
-func (user *SUser) AllowPerformLeave(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.SLeaveProjectsInput,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, user, "leave")
 }
 
 // 用户退出项目
@@ -1117,15 +1143,6 @@ func (user *SUser) GetUsages() []db.IUsage {
 	}
 }
 
-func (user *SUser) AllowPerformLinkIdp(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.UserLinkIdpInput,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, user, "link-idp")
-}
-
 // 用户和IDP的指定entityId关联
 func (user *SUser) PerformLinkIdp(
 	ctx context.Context,
@@ -1152,15 +1169,6 @@ func (user *SUser) PerformLinkIdp(
 		return nil, errors.Wrap(err, "IdmappingManager.RegisterIdMapWithId")
 	}
 	return nil, nil
-}
-
-func (user *SUser) AllowPerformUnlinkIdp(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.UserUnlinkIdpInput,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, user, "unlink-idp")
 }
 
 // 用户和IDP的指定entityId解除关联
@@ -1199,4 +1207,18 @@ func GetUserLangForKeyStone(uids []string) (map[string]string, error) {
 		ret[simpleUsers[i].Id] = simpleUsers[i].Lang
 	}
 	return ret, nil
+}
+
+// 用户加入项目
+func (user *SUser) PerformResetCredentials(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input api.ResetCredentialInput,
+) (jsonutils.JSONObject, error) {
+	err := CredentialManager.DeleteAll(ctx, userCred, user.Id, input.Type)
+	if err != nil {
+		return nil, errors.Wrap(err, "DeleteAll")
+	}
+	return nil, nil
 }

@@ -15,7 +15,11 @@
 package aws
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -202,7 +206,9 @@ func (self *SAwsClient) fetchRegions() ([]SRegion, error) {
 		}
 		svc := ec2.New(s)
 		// https://docs.aws.amazon.com/sdk-for-go/api/service/ec2/#EC2.DescribeRegions
-		result, err := svc.DescribeRegions(&ec2.DescribeRegionsInput{})
+		input := &ec2.DescribeRegionsInput{}
+		input.SetAllRegions(true)
+		result, err := svc.DescribeRegions(input)
 		if err != nil {
 			if e, ok := err.(awserr.Error); ok && e.Code() == "AuthFailure" {
 				return nil, errors.Wrap(httperrors.ErrInvalidAccessKey, err.Error())
@@ -239,6 +245,53 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 		return sess, nil
 	}
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
+	transport, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		var action string
+		if req.ContentLength > 0 {
+			body, err := ioutil.ReadAll(req.Body)
+			if err != nil {
+				return nil, errors.Wrapf(err, "ioutil.ReadAll")
+			}
+			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+			params, err := url.ParseQuery(string(body))
+			if err != nil {
+				return nil, errors.Wrapf(err, "ParseQuery(%s)", string(body))
+			}
+			action = params.Get("Action")
+		}
+
+		service := strings.Split(req.URL.Host, ".")[0]
+		method, path := req.Method, req.URL.Path
+		respCheck := func(resp *http.Response) {
+			if resp.StatusCode == 403 {
+				if client.cpcfg.UpdatePermission != nil {
+					if len(action) > 0 {
+						client.cpcfg.UpdatePermission(service, action)
+					} else { // s3
+						client.cpcfg.UpdatePermission(service, fmt.Sprintf("%s %s", method, path))
+					}
+				}
+			}
+		}
+
+		if client.cpcfg.ReadOnly {
+			if len(action) > 0 {
+				for _, prefix := range []string{"Get", "List", "Describe"} {
+					if strings.HasPrefix(action, prefix) {
+						return respCheck, nil
+					}
+				}
+				return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+			}
+			// s3
+			if req.Method == "GET" || req.Method == "HEAD" {
+				return respCheck, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return respCheck, nil
+	})
 	s, err := session.NewSession(&sdk.Config{
 		Region: sdk.String(regionId),
 		Credentials: credentials.NewStaticCredentials(
@@ -505,7 +558,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
-		cloudprovider.CLOUD_CAPABILITY_RDS + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_RDS,
 		cloudprovider.CLOUD_CAPABILITY_CACHE + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_NAT + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_EVENT,

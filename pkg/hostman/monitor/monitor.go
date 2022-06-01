@@ -17,6 +17,7 @@ package monitor
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -174,8 +175,9 @@ type Monitor interface {
 	BlockStream(drive string, idx, blkCnt int, callback StringCallback)
 	DriveMirror(callback StringCallback, drive, target, syncMode string, unmap, blockReplication bool)
 
+	MigrateSetDowntime(dtSec float32, callback StringCallback)
 	MigrateSetCapability(capability, state string, callback StringCallback)
-	MigrateSetParameter(key, val string, callback StringCallback)
+	MigrateSetParameter(key string, val interface{}, callback StringCallback)
 	MigrateIncoming(address string, callback StringCallback)
 	Migrate(destStr string, copyIncremental, copyFull bool, callback StringCallback)
 	GetMigrateStatus(callback StringCallback)
@@ -191,6 +193,8 @@ type Monitor interface {
 
 	NetdevAdd(id, netType string, params map[string]string, callback StringCallback)
 	NetdevDel(id string, callback StringCallback)
+
+	SaveState(statFilePath string, callback StringCallback)
 }
 
 type MonitorErrorFunc func(error)
@@ -282,4 +286,11 @@ func (m *SBaseMonitor) checkWriting() bool {
 		m.writing = true
 	}
 	return true
+}
+
+func getSaveStatefileUri(stateFilePath string) string {
+	if strings.HasSuffix(stateFilePath, ".gz") {
+		return fmt.Sprintf("exec:gzip -c > %s", stateFilePath)
+	}
+	return fmt.Sprintf("exec:cat > %s", stateFilePath)
 }

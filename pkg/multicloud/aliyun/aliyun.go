@@ -15,7 +15,11 @@
 package aliyun
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -179,6 +183,11 @@ func jsonRequest(client *sdk.Client, domain, apiVersion, apiName string, params 
 			if e, ok := errors.Cause(err).(*alierr.ServerError); ok {
 				code := e.ErrorCode()
 				switch code {
+				case "InternalError":
+					if apiName == "QueryAccountBalance" {
+						return nil, errors.Wrapf(httperrors.ErrNoPermission, err.Error())
+					}
+					return nil, err
 				case "InvalidAccessKeyId.NotFound",
 					"InvalidAccessKeyId",
 					"NoEnabledAccessKey",
@@ -392,6 +401,45 @@ func (self *SAliyunClient) getSdkClient(regionId string) (*sdk.Client, error) {
 		regionId,
 		&sdk.Config{
 			HttpTransport: transport,
+			Transport: cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+				params, err := url.ParseQuery(req.URL.RawQuery)
+				if err != nil {
+					return nil, errors.Wrapf(err, "ParseQuery(%s)", req.URL.RawQuery)
+				}
+				service := strings.Split(req.URL.Host, ".")[0]
+				action := params.Get("Action")
+				respCheck := func(resp *http.Response) {
+					if self.cpcfg.UpdatePermission != nil && resp.StatusCode >= 400 && resp.ContentLength > 0 {
+						body, err := ioutil.ReadAll(resp.Body)
+						if err != nil {
+							return
+						}
+						resp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+						obj, err := jsonutils.Parse(body)
+						if err != nil {
+							return
+						}
+						ret := struct{ Code string }{}
+						obj.Unmarshal(&ret)
+						if utils.IsInStringArray(ret.Code, []string{
+							"NoPermission",
+							"SubAccountNoPermission",
+						}) || utils.HasPrefix(ret.Code, "Forbidden") ||
+							action == "QueryAccountBalance" && ret.Code == "InternalError" {
+							self.cpcfg.UpdatePermission(service, action)
+						}
+					}
+				}
+				for _, prefix := range []string{"Get", "List", "Describe"} {
+					if strings.HasPrefix(action, prefix) {
+						return respCheck, nil
+					}
+				}
+				if self.cpcfg.ReadOnly {
+					return respCheck, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+				}
+				return respCheck, nil
+			}),
 		},
 		&credentials.BaseCredential{
 			AccessKeyId:     self.accessKey,
@@ -460,15 +508,13 @@ func (self *SAliyunClient) cdnRequest(apiName string, params map[string]string) 
 func (self *SAliyunClient) fetchRegions() error {
 	body, err := self.ecsRequest("DescribeRegions", map[string]string{"AcceptLanguage": "zh-CN"})
 	if err != nil {
-		log.Errorf("fetchRegions fail %s", err)
-		return err
+		return errors.Wrapf(err, "DescribeRegions")
 	}
 
 	regions := make([]SRegion, 0)
 	err = body.Unmarshal(&regions, "Regions", "Region")
 	if err != nil {
-		log.Errorf("unmarshal json error %s", err)
-		return err
+		return errors.Wrapf(err, "resp.Unmarshal")
 	}
 	self.iregions = make([]cloudprovider.ICloudRegion, len(regions))
 	for i := 0; i < len(regions); i += 1 {
@@ -500,8 +546,27 @@ func (client *SAliyunClient) getOssClientByEndpoint(endpoint string) (*oss.Clien
 	// https_proxy setting
 	// oss use no timeout client so as to send/download large files
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
+	transport, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		path, method := req.URL.Path, req.Method
+		respCheck := func(resp *http.Response) {
+			if client.cpcfg.UpdatePermission != nil && resp.StatusCode == 403 {
+				client.cpcfg.UpdatePermission("oss", fmt.Sprintf("%s %s", method, path))
+			}
+		}
+		if client.cpcfg.ReadOnly {
+			if req.Method == "GET" || req.Method == "HEAD" {
+				return respCheck, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.RawPath)
+		}
+		return respCheck, nil
+	})
 	cliOpts := []oss.ClientOption{
 		oss.HTTPClient(httpClient),
+	}
+	if !strings.HasPrefix(endpoint, "http") {
+		endpoint = "https://" + endpoint
 	}
 	cli, err := oss.New(endpoint, client.accessKey, client.accessSecret, cliOpts...)
 	if err != nil {

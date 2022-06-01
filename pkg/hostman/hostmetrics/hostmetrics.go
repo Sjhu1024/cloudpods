@@ -168,6 +168,9 @@ func (s *SGuestMonitorCollector) GetGuests() map[string]*SGuestMonitor {
 	guestmanager := guestman.GetGuestManager()
 	guestmanager.Servers.Range(func(k, v interface{}) bool {
 		guest := v.(*guestman.SKVMGuestInstance)
+		if !guest.IsValid() {
+			return false
+		}
 		pid := guest.GetPid()
 		if pid > 0 {
 			guestName, _ := guest.Desc.GetString("name")
@@ -499,14 +502,14 @@ func (m *SGuestMonitor) Netio() jsonutils.JSONObject {
 		uptime, _ := host.Uptime()
 		meta.Set("uptime", jsonutils.NewInt(int64(uptime)))
 		data.Set("meta", meta)
-		data.Set("bits_recv", jsonutils.NewInt(int64(nicStat.BytesRecv*8)))
-		data.Set("bits_sent", jsonutils.NewInt(int64(nicStat.BytesSent*8)))
-		data.Set("packets_recv", jsonutils.NewInt(int64(nicStat.PacketsRecv)))
-		data.Set("packets_sent", jsonutils.NewInt(int64(nicStat.PacketsSent)))
-		data.Set("err_out", jsonutils.NewInt(int64(nicStat.Errout)))
-		data.Set("err_in", jsonutils.NewInt(int64(nicStat.Errin)))
-		data.Set("drop_out", jsonutils.NewInt(int64(nicStat.Dropout)))
-		data.Set("drop_in", jsonutils.NewInt(int64(nicStat.Dropin)))
+		data.Set("bits_recv", jsonutils.NewInt(int64(nicStat.BytesSent*8)))
+		data.Set("bits_sent", jsonutils.NewInt(int64(nicStat.BytesRecv*8)))
+		data.Set("packets_recv", jsonutils.NewInt(int64(nicStat.PacketsSent)))
+		data.Set("packets_sent", jsonutils.NewInt(int64(nicStat.PacketsRecv)))
+		data.Set("err_out", jsonutils.NewInt(int64(nicStat.Errin)))
+		data.Set("err_in", jsonutils.NewInt(int64(nicStat.Errout)))
+		data.Set("drop_out", jsonutils.NewInt(int64(nicStat.Dropin)))
+		data.Set("drop_in", jsonutils.NewInt(int64(nicStat.Dropout)))
 		res.Add(data)
 	}
 	return res

@@ -37,12 +37,14 @@ type SSHable struct {
 	Ok     bool
 	Reason string
 
-	User string
-	Host string
-	Port int
+	User     string
+	Host     string
+	Port     int
+	Password string
 
 	ServerName       string
 	ServerHypervisor string
+	OsType           string
 
 	ProxyEndpointId string
 	ProxyAgentId    string
@@ -93,7 +95,7 @@ type SServerInfo struct {
 }
 
 func CheckSshableForYunionCloud(session *mcclient.ClientSession, serverInfo SServerInfo) (sshable SSHable, cleanFunc func() error, err error) {
-	sshable, clean, err := checkSshableForYunionCloud(session, serverInfo)
+	sshable, clean, err := checkSshableForYunionCloud(session, serverInfo, false)
 	if err != nil {
 		return
 	}
@@ -115,20 +117,42 @@ func CheckSshableForYunionCloud(session *mcclient.ClientSession, serverInfo SSer
 	return
 }
 
-func checkSshableForYunionCloud(session *mcclient.ClientSession, serverInfo SServerInfo) (sshable SSHable, clean bool, err error) {
+func getLoginInfo(session *mcclient.ClientSession, serverId string) (username string, password string, err error) {
+	ret, err := modules.Servers.GetLoginInfo(session, serverId, jsonutils.NewDict())
+	if err != nil {
+		return
+	}
+	username, _ = ret.GetString("username")
+	password, _ = ret.GetString("password")
+	return
+}
+
+func checkSshableForYunionCloud(session *mcclient.ClientSession, serverInfo SServerInfo, isWindows bool) (sshable SSHable, clean bool, err error) {
+	port, err := getServerSshport(session, serverInfo.Id, isWindows)
+	if err != nil {
+		err = errors.Wrapf(err, "unable to get ssh port of server %s", serverInfo.Id)
+		return
+	}
 	ip := serverInfo.Ip
-	if serverInfo.Hypervisor == comapi.HYPERVISOR_BAREMETAL || serverInfo.VpcId == "" || serverInfo.VpcId == comapi.DEFAULT_VPC_ID {
-		sshable = SSHable{
-			Ok:   true,
-			User: "cloudroot",
-			Host: ip,
-			Port: 22,
+	username, password := "cloudroot", ""
+	if isWindows {
+		username, password, err = getLoginInfo(session, serverInfo.Id)
+		if err != nil {
+			return
 		}
+		sshable.OsType = "Windows"
+	}
+	sshable.User = username
+	sshable.Password = password
+	sshable.Port = port
+	sshable.Host = ip
+	if serverInfo.Hypervisor == comapi.HYPERVISOR_BAREMETAL || serverInfo.VpcId == "" || serverInfo.VpcId == comapi.DEFAULT_VPC_ID {
+		sshable.Ok = true
 		return
 	}
 	lfParams := jsonutils.NewDict()
 	lfParams.Set("proto", jsonutils.NewString("tcp"))
-	lfParams.Set("port", jsonutils.NewInt(22))
+	lfParams.Set("port", jsonutils.NewInt(int64(port)))
 	lfParams.Set("addr", jsonutils.NewString(ip))
 	data, err := modules.Servers.PerformAction(session, serverInfo.Id, "list-forward", lfParams)
 	if err != nil {
@@ -162,12 +186,9 @@ func checkSshableForYunionCloud(session *mcclient.ClientSession, serverInfo SSer
 	proxyAddr, _ := forward.GetString("proxy_addr")
 	proxyPort, _ := forward.Int("proxy_port")
 	// register
-	sshable = SSHable{
-		Ok:   true,
-		User: "cloudroot",
-		Host: proxyAddr,
-		Port: int(proxyPort),
-	}
+	sshable.Port = int(proxyPort)
+	sshable.Host = proxyAddr
+	sshable.Ok = true
 	return
 }
 
@@ -176,6 +197,10 @@ func checkSshableForYunionCloudWithDetail(session *mcclient.ClientSession, serve
 		err = fmt.Errorf("empty ips for server %s", serverDetail.Id)
 		return
 	}
+	isWindows := false
+	if serverDetail.OsType == "Windows" {
+		isWindows = true
+	}
 	ips := strings.Split(serverDetail.IPs, ",")
 	ip := strings.TrimSpace(ips[0])
 	return checkSshableForYunionCloud(session, SServerInfo{
@@ -183,7 +208,7 @@ func checkSshableForYunionCloudWithDetail(session *mcclient.ClientSession, serve
 		Id:         serverDetail.Id,
 		Hypervisor: serverDetail.Hypervisor,
 		VpcId:      serverDetail.VpcId,
-	})
+	}, isWindows)
 }
 
 func CheckSSHable(session *mcclient.ClientSession, serverId string) (sshable SSHable, cleanFunc func() error, err error) {
@@ -252,10 +277,15 @@ func CheckSSHable(session *mcclient.ClientSession, serverId string) (sshable SSH
 	if len(sshable.ProxyEndpointId) == 0 {
 		return
 	} else {
+		var sshport int
+		sshport, err = getServerSshport(session, serverDetail.Id, false)
+		if err != nil {
+			err = errors.Wrapf(err, "unable to get sshport of server %s", serverDetail.Id)
+		}
 		// create local forward
 		createP := jsonutils.NewDict()
 		createP.Set("type", jsonutils.NewString(cloudproxy_api.FORWARD_TYPE_LOCAL))
-		createP.Set("remote_port", jsonutils.NewInt(22))
+		createP.Set("remote_port", jsonutils.NewInt(int64(sshport)))
 		createP.Set("server_id", jsonutils.NewString(serverDetail.Id))
 
 		var forward jsonutils.JSONObject
@@ -311,6 +341,21 @@ func GetCleanFunc(session *mcclient.ClientSession, hypervisor, serverId, host, f
 	return func() error {
 		return clearLocalForward(session, forward)
 	}
+}
+
+func getServerSshport(session *mcclient.ClientSession, serverId string, isWindows bool) (int, error) {
+	if isWindows {
+		return 5985, nil
+	}
+	data, err := modules.Servers.GetSpecific(session, serverId, "sshport", nil)
+	if err != nil {
+		return 0, err
+	}
+	port, _ := data.Int("port")
+	if port == 0 {
+		port = 22
+	}
+	return int(port), nil
 }
 
 func clearLocalForward(s *mcclient.ClientSession, forwardId string) error {

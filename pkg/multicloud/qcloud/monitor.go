@@ -74,11 +74,11 @@ type SBatchQueryMetricDataInput struct {
 
 func (r *SRegion) metricsRequest(action string, params map[string]string) (jsonutils.JSONObject, error) {
 	client := r.GetClient()
-	cli, err := client.getDefaultClient()
+	cli, err := client.getDefaultClient(params)
 	if err != nil {
 		return nil, err
 	}
-	return monitorRequest(cli, action, params, client.debug)
+	return monitorRequest(cli, action, params, client.cpcfg.UpdatePermission, client.debug)
 }
 
 func (r *SRegion) GetMonitorData(name string, ns string, since time.Time, until time.Time, demensions []SQcInstanceMetricDimension) ([]SDataPoint, error) {

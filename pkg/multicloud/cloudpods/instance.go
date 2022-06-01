@@ -173,6 +173,9 @@ func (self *SInstance) AssignSecurityGroup(id string) error {
 }
 
 func (self *SInstance) SetSecurityGroups(ids []string) error {
+	if self.Hypervisor == api.HYPERVISOR_ESXI {
+		return nil
+	}
 	input := api.GuestSetSecgroupInput{}
 	input.SecgroupIds = ids
 	_, err := self.host.zone.region.perform(&modules.Servers, self.Id, "set-secgroup", input)
@@ -361,18 +364,35 @@ func (self *SInstance) ResetToInstanceSnapshot(ctx context.Context, idStr string
 }
 
 func (self *SInstance) SaveImage(opts *cloudprovider.SaveImageOptions) (cloudprovider.ICloudImage, error) {
+	return self.host.zone.region.SaveImage(self.Id, opts.Name, opts.Notes)
+}
+
+func (self *SRegion) SaveImage(id, imageName, notes string) (*SImage, error) {
 	input := api.ServerSaveImageInput{}
-	input.GenerateName = opts.Name
-	input.Notes = opts.Notes
-	resp, err := self.host.zone.region.perform(&modules.Servers, self.Id, "save-image", input)
+	input.GenerateName = imageName
+	input.Notes = notes
+	resp, err := self.perform(&modules.Servers, id, "save-image", input)
 	if err != nil {
 		return nil, err
 	}
-	err = resp.Unmarshal(&input)
+	imageId, err := resp.GetString("image_id")
 	if err != nil {
 		return nil, err
 	}
-	return self.host.zone.region.GetImage(input.ImageId)
+	caches, err := self.GetStoragecaches()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetStoragecaches")
+	}
+	if len(caches) == 0 {
+		return nil, fmt.Errorf("no storage cache found")
+	}
+	caches[0].region = self
+	image, err := self.GetImage(imageId)
+	if err != nil {
+		return nil, err
+	}
+	image.cache = &caches[0]
+	return image, nil
 }
 
 func (self *SInstance) AllocatePublicIpAddress() (string, error) {

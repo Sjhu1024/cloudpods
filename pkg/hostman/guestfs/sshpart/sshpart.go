@@ -24,9 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/baremetal/utils/disktool"
@@ -398,6 +397,18 @@ func (p *SSHPartition) Remove(sPath string, caseInsensitive bool) {
 func (p *SSHPartition) CheckOrAddUser(user, homeDir string, isSys bool) (realHomeDir string, err error) {
 	var exist bool
 	if exist, realHomeDir, err = p.checkUser(user); err != nil || exist {
+		if exist {
+			cmd := []string{"chage", "-R", p.mountPath, "-E", "-1", "-m", "0", "-M", "99999", "-I", "-1", user}
+			_, err = p.term.Run(strings.Join(cmd, " "))
+			if err != nil {
+				if !strings.Contains(err.Error(), "not found") {
+					err = errors.Wrap(err, "chage")
+					return
+				} else {
+					err = nil
+				}
+			}
+		}
 		return
 	}
 	return path.Join(homeDir, user), p.userAdd(user, homeDir, isSys)
@@ -590,12 +601,12 @@ func MountSSHRootfs(term *ssh.Client, layouts []baremetal.Layout) (*SSHPartition
 		if !dev.Mount() {
 			continue
 		}
-		if rootFs := guestfs.DetectRootFs(dev); rootFs != nil {
+		rootFs, err := guestfs.DetectRootFs(dev)
+		if err == nil {
 			log.Infof("Use class %#v", rootFs)
 			return dev, rootFs, nil
-		} else {
-			dev.Umount()
 		}
+		dev.Umount()
 	}
 	return nil, nil, fmt.Errorf("Fail to find rootfs")
 }

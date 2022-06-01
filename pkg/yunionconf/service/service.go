@@ -45,9 +45,9 @@ func StartService() {
 
 	app := app_common.InitApp(baseOpts, true)
 	InitHandlers(app)
-	cloudcommon.AppDBInit(app)
+	db.AppDBInit(app)
 
-	if db.CheckSync(opts.AutoSyncTable) {
+	if db.CheckSync(opts.AutoSyncTable, opts.EnableDBChecksumTables, opts.DBChecksumSkipInit) {
 		err := models.InitDB()
 		if err == nil {
 			app_common.ServeForeverWithCleanup(app, baseOpts, func() {

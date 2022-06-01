@@ -23,14 +23,186 @@ Cloudpods is a cloud-native open source unified multi/hybrid-cloud platform deve
 
 ## Features
 
-* Multi-cloud management that is able to manage a wide range of cloud providers, including private cloud, such as OpenStack, and public clouds, such as AWS, Azure, Google Cloud, Alibaba Cloud, Tencent Cloud, Huawei Cloud, etc.
-* Cloud SSO that allows accessing native webconsole of cloud providers with unified federated identities
-* A light-weight private cloud that manages KVM hypervisor in scale
-* A BareMetal cloud that automates the full life-cycle management of baremetal physical machines
-* VMware vSphere management that enables self-service and automation
-* One set of feature-rich APIs to access a wide range of resources from cloud providers above with consistent models and APIs
-* A complete multi-tenancy RBAC-enabled IAM (identity and access management) system
-* Multi-cloud image management system that automates image conversion between different cloud providers
+### Summary & UI
+
+<details>
+  <summary>
+  Multi-cloud management that is able to manage a wide range of cloud providers, including private cloud, such as OpenStack, and public clouds, such as AWS, Azure, Google Cloud, Alibaba Cloud, Tencent Cloud, Huawei Cloud, etc.
+  </summary>
+  <ul>
+    <li>
+      <p>Cloud account create form</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/cloudselect.png" alt="multi cloud management">
+    </li>
+    <li>
+      <p>Cloud accounts list</p>
+      <img src="https://i.imgur.com/Q0LipfI.png" alt="cloud account list">
+    </li>
+    <li>
+      <p>Multi public cloud VM list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/publicvmlist.png">
+    </li>
+  </ul>
+</details>
+
+<details>
+  <summary>
+  A light-weight private cloud that manages KVM hypervisor in scale
+  </summary>
+  <ul>
+    <li>
+      <p>VM instances list</p>
+      <img src="https://i.imgur.com/DbkRUoo.png">
+    </li>
+    <li>
+      <p>Create VM instance form</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createkvmvm1.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createkvmvm2.png">
+    </li>
+    <li>
+      <p>VNC and SSH login page</p>
+      <img src="https://i.imgur.com/m0rkeQ3.png">
+    </li>
+    <li>
+      <p>Host list</p>
+      <img src="https://imgur.com/i509t5a.png">
+    </li>
+    <li>
+      <p>Image template list</p>
+      <img src="https://imgur.com/UVFLGi2.png">
+    </li>
+    <li>
+      <p>VPC list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/vpclist.png">
+    </li>
+    <li>
+      <p>Wire list (Classic Network)</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/wirelist.png">
+    </li>
+    <li>
+      <p>IPsubnet list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/ipsubnetlist.png">
+    </li> 
+    <li>
+      <p>Eip list (VPC Network)</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/vpclist.png">
+    </li>
+    <li>
+      <p>LB list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/lblist.png">
+    </li>   
+  </ul>
+</details>
+
+<details>
+  <summary>
+  A BareMetal cloud that automates the full life-cycle management of baremetal physical machines
+  </summary>
+  <ul>
+    <li>
+      <p>BareMetal list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/physicalmachinelist.png">
+    </li>
+    <li>
+      <p>Baremetal Management</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/addphysicalmachine.png">
+    </li>
+    <li>
+      <p>Create OS on BareMetal</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createbaremetal.png">
+    </li>
+    <li>ARM64 baremetal supported</li>
+  </ul>
+</details>
+
+<details>
+  <summary>
+  A complete multi-tenancy RBAC-enabled IAM (identity and access management) system
+  </summary>
+  <ul>
+    <li>
+      <p>sql, LDAP supported</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/idplist.png">
+    </li>
+    <li>
+      <p>Multi-tenancy system, include domain, project, group, user, role, policy</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/domainlist.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/projectlist.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/grouplist.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/userlist.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/rolelist.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/policylist.png">
+  </ul>
+</details>
+
+<details>
+  <summary>
+  VMware vSphere management that enables self-service and automation
+  </summary>
+  <ul>
+    <li>
+      <p>Add VMware account</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createvmware.png">
+    </li>
+    <li>
+      <p>VMware account list</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/vmwarelist.png">
+    </li>
+    <li>
+      <p>Automatic creation of wire</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/vmwarewirelist.png">
+    </li>
+    <li>
+      <p>Automatic creation of ipsubnet</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/vmwareipsubnetlist.png">
+    </li>
+    <li>
+      <p>Create a VMware VM instance</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createvmwarevm1.png">
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/createvmwarevm2.png">
+    </li>
+  </ul>
+</details>
+
+
+<details>
+  <summary>
+  Cloud SSO that allows accessing native webconsole of cloud providers with unified federated identities
+  </summary>
+  <ul>
+    <li>
+      <p>Enable the SSO login function of the cloud account (aliyun as an example)</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/enablecloudsso.png">
+    </li>
+    <li>
+      <p>create saml users</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/addsamluser.png">
+    </li>
+    <li>
+      <p>Cloud SSO entry</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/cloudssoentry.png">
+    </li>
+    <li>
+      <p>Cloud SSO - SSO login user</p>
+      <img src="https://www.cloudpods.org/zh/docs/introduce/ui/images/cloudsamluser.png">
+    </li>
+    <li>
+      <p>Sign in to the public cloud platform with SSO</p>
+    </li>
+  </ul>
+</details>
+
+<details>
+  <summary>
+  One set of feature-rich APIs to access a wide range of resources from cloud providers above with consistent models and APIs
+  </summary>
+</details>
+
+<details>
+  <summary>
+  Multi-cloud image management system that automates image conversion between different cloud providers
+  </summary>
+</details>
 
 ### Supported cloud providers
 
@@ -48,7 +220,9 @@ Cloudpods is a cloud-native open source unified multi/hybrid-cloud platform deve
 * Private Clouds:
   * OpenStack
   * ZStack
-  * AlibabaCloud Aspara
+  * Alibaba Cloud Aspara
+  * Huawei HCSO
+  * Nutanix
 * On-premise resources:
   * KVM
   * VMWare vSphere vCenter/ESXi
@@ -78,8 +252,8 @@ You may install Cloudpods in a Linux box (currently CentOS 7 and Debian 10 are f
 
 ```bash
 # Generate a local ssh keypair
-# (SKIP this step if you already have ~/.ssh/id_rsa.pub locally)
-$ ssh-keygen
+# (SKIP this step if you already have ~/.ssh/id_rsa.pub locally. Make sure generating key WIHOUT passphrase)
+$ ssh-keygen -t rsa -N ''
 
 # Copy the generated ~/.ssh/id_rsa.pub public key to the machine to be deployed
 $ ssh-copy-id -i ~/.ssh/id_rsa.pub root@10.168.26.216
@@ -108,7 +282,7 @@ Run the following commands to start installing Cloudpods.
 
 ```bash
 # Git clone the ocboot installation tool locally
-$ git clone https://github.com/yunionio/ocboot && cd ./ocboot && ./run.py 10.168.26.216
+$ git clone -b release/3.8 https://github.com/yunionio/ocboot && cd ./ocboot && ./run.py 10.168.26.216
 ```
 
 It takes 10-30 minutes to finish the installation. You may visit the webconsole of Cloudpods at https://10.168.26.216. The initial login account is *admin* and password is *admin@123*.
@@ -131,7 +305,7 @@ Please check this [issue](https://github.com/yunionio/cloudpods/issues/11427) fo
 
 You may contact us by:
 
-* Reddit: [r/Cloudpods](https://www.reddit.com/r/Cloudpods/)
+* [Subscription](https://www.yunion.cn/subscription/index.html)
 
 * Bilibili: [Cloudpods](https://space.bilibili.com/623431553/)
 

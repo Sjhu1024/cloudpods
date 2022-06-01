@@ -87,6 +87,9 @@ type ComputeOptions struct {
 	DefaultHostQuota int `default:"500" help:"Common host quota per domain, default 500"`
 	DefaultVpcQuota  int `default:"500" help:"Common vpc quota per domain, default 500"`
 
+	DefaultDiskDriver    string `help:"default disk driver" choices:"scsi|virtio|ide" default:"scsi"`
+	DefaultDiskCacheMode string `help:"default kvm disk cache mode" choices:"writeback|none|writethrough" default:"writeback"`
+
 	SystemAdminQuotaCheck         bool `help:"Enable quota check for system admin, default False" default:"false"`
 	CloudaccountHealthStatusCheck bool `help:"Enable cloudaccount health status check, default True" default:"true"`
 
@@ -134,7 +137,6 @@ type ComputeOptions struct {
 	CloudProviderSyncWorkerCount int `help:"how many current providers synchronize their regions, practically no limit" default:"10"`
 	CloudAutoSyncIntervalSeconds int `help:"frequency to check auto sync tasks" default:"30"`
 	DefaultSyncIntervalSeconds   int `help:"minimal synchronization interval, default 15 minutes" default:"900"`
-	MinimalSyncIntervalSeconds   int `help:"minimal synchronization interval, default 30 minutes" default:"1800"`
 	MaxCloudAccountErrorCount    int `help:"maximal consecutive error count allow for a cloud account" default:"5"`
 
 	NameSyncResources []string `help:"resources that need synchronization of name"`
@@ -179,6 +181,9 @@ type ComputeOptions struct {
 	GlobalMacPrefix string `help:"Global prefix of MAC address, default to 00:22" default:"00:22"`
 
 	DefaultIPAllocationDirection string `help:"default IP allocation direction" default:"stepdown"`
+
+	// 弹性伸缩中的ecs一般会有特殊的系统标签，通过指定这些标签可以忽略这部分ecs的同步, 指定多个key需要以 ',' 分隔
+	SkipServerBySysTagKeys string `help:"skip server sync and create with system tags" default:"acs:autoscaling:scalingGroupId"`
 
 	esxi.EsxiOptions
 }

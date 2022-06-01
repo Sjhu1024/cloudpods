@@ -42,6 +42,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/pinyinutils"
 	"yunion.io/x/onecloud/pkg/util/rand"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
 )
 
 type SAwsRegionDriver struct {
@@ -96,6 +97,67 @@ func networkCheck(network *models.SNetwork) error {
 	}
 
 	return nil
+}
+
+func (self *SAwsRegionDriver) IsSupportedDBInstance() bool {
+	return true
+}
+
+func (self *SAwsRegionDriver) GetRdsSupportSecgroupCount() int {
+	return 1
+}
+
+func (self *SAwsRegionDriver) ValidateCreateDBInstanceData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.DBInstanceCreateInput, skus []models.SDBInstanceSku, network *models.SNetwork) (api.DBInstanceCreateInput, error) {
+	if len(input.Password) > 0 {
+		for _, s := range input.Password {
+			if s == '/' || s == '"' || s == '@' || s == '\'' {
+				return input, httperrors.NewInputParameterError("aws rds not support password character %s", string(s))
+			}
+		}
+	}
+	if len(input.Password) == 0 {
+		for _, s := range seclib2.RandomPassword2(100) {
+			if s == '/' || s == '"' || s == '@' || s == '\'' {
+				continue
+			}
+			input.Password += string(s)
+			if len(input.Password) >= 20 {
+				break
+			}
+		}
+	}
+	return input, nil
+}
+
+func (self *SAwsRegionDriver) ValidateCreateDBInstanceBackupData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, instance *models.SDBInstance, input api.DBInstanceBackupCreateInput) (api.DBInstanceBackupCreateInput, error) {
+	return input, nil
+}
+
+func (self *SAwsRegionDriver) ValidateCreateDBInstanceDatabaseData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, instance *models.SDBInstance, input api.DBInstanceDatabaseCreateInput) (api.DBInstanceDatabaseCreateInput, error) {
+	return input, httperrors.NewNotSupportedError("aws not support create rds database")
+}
+
+func (self *SAwsRegionDriver) ValidateCreateDBInstanceAccountData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, instance *models.SDBInstance, input api.DBInstanceAccountCreateInput) (api.DBInstanceAccountCreateInput, error) {
+	return input, httperrors.NewNotSupportedError("aws not support create rds account")
+}
+
+func (self *SAwsRegionDriver) InitDBInstanceUser(ctx context.Context, instance *models.SDBInstance, task taskman.ITask, desc *cloudprovider.SManagedDBInstanceCreateConfig) error {
+	user := "admin"
+	if desc.Engine == api.DBINSTANCE_TYPE_POSTGRESQL || desc.Category == api.DBINSTANCE_TYPE_POSTGRESQL {
+		user = "postgres"
+	}
+
+	account := models.SDBInstanceAccount{}
+	account.DBInstanceId = instance.Id
+	account.Name = user
+	account.Status = api.DBINSTANCE_USER_AVAILABLE
+	account.SetModelManager(models.DBInstanceAccountManager, &account)
+	err := models.DBInstanceAccountManager.TableSpec().Insert(ctx, &account)
+	if err != nil {
+		return err
+	}
+
+	return account.SetPassword(desc.Password)
 }
 
 func validateAwsLbNetwork(ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, requiredMin int) (*jsonutils.JSONDict, error) {
@@ -802,7 +864,7 @@ func (self *SAwsRegionDriver) createLoadbalancerBackendGroup(ctx context.Context
 		return nil, errors.Wrap(err, "AwsRegionDriver.createlbBackendgroup.GetAwsBackendGroupParams")
 	}
 
-	iRegion, err := lbbg.GetIRegion()
+	iRegion, err := lbbg.GetIRegion(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "AwsRegionDriver.createlbBackendgroup.GetIRegion")
 	}
@@ -927,7 +989,7 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerBackend(ctx context.Conte
 
 		var ibackend cloudprovider.ICloudLoadbalancerBackend
 		for _, cachedLbbg := range cachedlbbgs {
-			iLoadbalancerBackendGroup, err := cachedLbbg.GetICloudLoadbalancerBackendGroup()
+			iLoadbalancerBackendGroup, err := cachedLbbg.GetICloudLoadbalancerBackendGroup(ctx)
 			if err != nil {
 				return nil, errors.Wrap(err, "AwsRegionDriver.RequestCreateLoadbalancerBackend.GetICloudLoadbalancerBackendGroup")
 			}
@@ -973,7 +1035,7 @@ func (self *SAwsRegionDriver) RequestDeleteLoadbalancerBackend(ctx context.Conte
 			if lb == nil {
 				return nil, fmt.Errorf("failed to find lb for backendgroup %s", cachedlbbg.Name)
 			}
-			iRegion, err := lb.GetIRegion()
+			iRegion, err := lb.GetIRegion(ctx)
 			if err != nil {
 				return nil, errors.Wrap(err, "AwsRegionDriver.RequestDeleteLoadbalancerBackend.GetIRegion")
 			}
@@ -1066,7 +1128,7 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerListener(ctx context.Cont
 			group, _ := models.AwsCachedLbbgManager.GetUsableCachedBackendGroup(lblis.LoadbalancerId, lblis.BackendGroupId, lblis.ListenerType, lblis.HealthCheckType, lblis.HealthCheckInterval)
 			if group != nil {
 				// 服务器组存在
-				ilbbg, err := group.GetICloudLoadbalancerBackendGroup()
+				ilbbg, err := group.GetICloudLoadbalancerBackendGroup(ctx)
 				if err != nil {
 					return nil, errors.Wrap(err, "awsRegionDriver.RequestCreateLoadbalancerListener.GetICloudLoadbalancerBackendGroup")
 				}
@@ -1092,7 +1154,7 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerListener(ctx context.Cont
 			return nil, errors.Wrap(err, "awsRegionDriver.RequestCreateLoadbalancerListener.GetAwsLoadbalancerListenerParams")
 		}
 
-		iRegion, err := loadbalancer.GetIRegion()
+		iRegion, err := loadbalancer.GetIRegion(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "awsRegionDriver.RequestCreateLoadbalancerListener.GetIRegion")
 		}
@@ -1125,7 +1187,7 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerListenerRule(ctx context.
 		if err != nil {
 			return nil, err
 		}
-		iRegion, err := loadbalancer.GetIRegion()
+		iRegion, err := loadbalancer.GetIRegion(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1168,7 +1230,7 @@ func (self *SAwsRegionDriver) RequestDeleteLoadbalancerBackendGroup(ctx context.
 			return nil, nil
 		}
 
-		iRegion, err := lbbg.GetIRegion()
+		iRegion, err := lbbg.GetIRegion(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "AwsRegionDriver.RequestDeleteLoadbalancerBackendGroup.GetIRegion")
 		}
@@ -1229,7 +1291,7 @@ func (self *SAwsRegionDriver) RequestDeleteLoadbalancer(ctx context.Context, use
 			return nil, nil
 		}
 
-		iRegion, err := lb.GetIRegion()
+		iRegion, err := lb.GetIRegion(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "AwsRegionDriver.RequestDeleteLoadbalancer.GetIRegion")
 		}
@@ -1367,7 +1429,7 @@ func (self *SAwsRegionDriver) RequestSyncLoadbalancerListener(ctx context.Contex
 		if err != nil {
 			return nil, err
 		}
-		iRegion, err := loadbalancer.GetIRegion()
+		iRegion, err := loadbalancer.GetIRegion(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "awsRegionDriver.RequestSyncLoadbalancerListener.GetIRegion")
 		}
@@ -1461,7 +1523,7 @@ func (self *SAwsRegionDriver) RequestDeleteVpc(ctx context.Context, userCred mcc
 			return nil, fmt.Errorf("vpc %s(%s) related provider not  found", vpc.GetName(), vpc.GetName())
 		}
 
-		region, err := vpc.GetIRegion()
+		region, err := vpc.GetIRegion(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "vpc.GetIRegion")
 		}
@@ -1514,7 +1576,7 @@ func (self *SAwsRegionDriver) RequestDeleteVpc(ctx context.Context, userCred mcc
 
 func (self *SAwsRegionDriver) RequestAssociateEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iEip, err := eip.GetIEip()
+		iEip, err := eip.GetIEip(ctx)
 		if err != nil {
 			return nil, errors.Wrapf(err, "eip.GetIEip")
 		}

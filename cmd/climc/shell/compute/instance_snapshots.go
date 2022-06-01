@@ -15,6 +15,8 @@
 package compute
 
 import (
+	"yunion.io/x/jsonutils"
+
 	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
@@ -24,12 +26,20 @@ func init() {
 	type InstanceSnapshotsListOptions struct {
 		options.BaseListOptions
 
-		GuestId string `help:"guest id" json:"guest_id"`
+		GuestId      string `help:"guest id" json:"guest_id"`
+		HasMemory    bool   `help:"contains memory snapshot" json:"-"`
+		NotHasMemory bool   `help:"not contains memory snapshot" json:"-"`
 	}
 	R(&InstanceSnapshotsListOptions{}, "instance-snapshot-list", "Show instance snapshots", func(s *mcclient.ClientSession, args *InstanceSnapshotsListOptions) error {
 		params, err := options.ListStructToParams(args)
 		if err != nil {
 			return err
+		}
+		if args.HasMemory {
+			params.Set("with_memory", jsonutils.NewBool(true))
+		}
+		if args.NotHasMemory {
+			params.Set("with_memory", jsonutils.NewBool(false))
 		}
 		result, err := modules.InstanceSnapshots.List(s, params)
 		if err != nil {
@@ -51,7 +61,7 @@ func init() {
 	type InstanceSnapshotShowOptions struct {
 		ID string `help:"ID or Name of snapshot"`
 	}
-	R(&InstanceSnapshotShowOptions{}, "snapshot-show", "Show snapshot details", func(s *mcclient.ClientSession, args *InstanceSnapshotShowOptions) error {
+	R(&InstanceSnapshotShowOptions{}, "instance-snapshot-show", "Show snapshot details", func(s *mcclient.ClientSession, args *InstanceSnapshotShowOptions) error {
 		result, err := modules.InstanceSnapshots.Get(s, args.ID, nil)
 		if err != nil {
 			return err

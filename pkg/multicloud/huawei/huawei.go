@@ -15,10 +15,16 @@
 package huawei
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/huaweicloud/huaweicloud-sdk-go/auth/aksk"
+
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/timeutils"
@@ -29,6 +35,7 @@ import (
 	"yunion.io/x/onecloud/pkg/multicloud/huawei/client/auth"
 	"yunion.io/x/onecloud/pkg/multicloud/huawei/client/auth/credentials"
 	"yunion.io/x/onecloud/pkg/multicloud/huawei/obs"
+	"yunion.io/x/onecloud/pkg/util/httputils"
 )
 
 /*
@@ -106,6 +113,8 @@ type SHuaweiClient struct {
 
 	projects []SProject
 	regions  []SRegion
+
+	httpClient *http.Client
 }
 
 // 进行资源操作时参数account 对应数据库cloudprovider表中的account字段,由accessKey和projectID两部分组成，通过"/"分割。
@@ -152,28 +161,151 @@ func (self *SHuaweiClient) initSigner() error {
 	return nil
 }
 
+func (self *SHuaweiClient) getDefaultClient() *http.Client {
+	if self.httpClient != nil {
+		return self.httpClient
+	}
+	self.httpClient = self.cpcfg.AdaptiveTimeoutHttpClient()
+	ts, _ := self.httpClient.Transport.(*http.Transport)
+	self.httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		service, method, path := strings.Split(req.URL.Host, ".")[0], req.Method, req.URL.Path
+		respCheck := func(resp *http.Response) {
+			if resp.StatusCode == 403 {
+				if self.cpcfg.UpdatePermission != nil {
+					self.cpcfg.UpdatePermission(service, fmt.Sprintf("%s %s", method, path))
+				}
+			}
+		}
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" {
+				return respCheck, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return respCheck, nil
+	})
+	return self.httpClient
+}
+
 func (self *SHuaweiClient) newRegionAPIClient(regionId string) (*client.Client, error) {
-	cli, err := client.NewPublicCloudClientWithAccessKey(regionId, self.ownerId, self.projectId, self.accessKey, self.accessSecret, self.debug)
+	projectId := self.projectId
+	if len(regionId) == 0 {
+		projectId = ""
+	}
+	cli, err := client.NewPublicCloudClientWithAccessKey(regionId, self.ownerId, projectId, self.accessKey, self.accessSecret, self.debug)
 	if err != nil {
 		return nil, err
 	}
 
-	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
+	httpClient := self.getDefaultClient()
 	cli.SetHttpClient(httpClient)
 
 	return cli, nil
 }
 
+type sPageInfo struct {
+	NextMarker string
+}
+
 func (self *SHuaweiClient) newGeneralAPIClient() (*client.Client, error) {
-	cli, err := client.NewPublicCloudClientWithAccessKey("", self.ownerId, "", self.accessKey, self.accessSecret, self.debug)
+	return self.newRegionAPIClient("")
+}
+
+func (self *SHuaweiClient) lbList(regionId, resource string, query url.Values) (jsonutils.JSONObject, error) {
+	url := fmt.Sprintf("https://elb.%s.myhuaweicloud.com/v2/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.GET, url, query, nil)
+}
+
+func (self *SHuaweiClient) lbGet(regionId, resource string) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://elb.%s.myhuaweicloud.com/v2/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.GET, uri, url.Values{}, nil)
+}
+
+func (self *SHuaweiClient) lbCreate(regionId, resource string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://elb.%s.myhuaweicloud.com/v2/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.POST, uri, url.Values{}, params)
+}
+
+func (self *SHuaweiClient) lbUpdate(regionId, resource string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://elb.%s.myhuaweicloud.com/v2/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.PUT, uri, url.Values{}, params)
+}
+
+func (self *SHuaweiClient) lbDelete(regionId, resource string) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://elb.%s.myhuaweicloud.com/v2/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.DELETE, uri, url.Values{}, nil)
+}
+
+func (self *SHuaweiClient) vpcList(regionId, resource string, query url.Values) (jsonutils.JSONObject, error) {
+	url := fmt.Sprintf("https://vpc.%s.myhuaweicloud.com/v1/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.GET, url, query, nil)
+}
+
+func (self *SHuaweiClient) vpcCreate(regionId, resource string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://vpc.%s.myhuaweicloud.com/v1/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.POST, uri, url.Values{}, params)
+}
+
+func (self *SHuaweiClient) vpcGet(regionId, resource string) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://vpc.%s.myhuaweicloud.com/v1/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.GET, uri, url.Values{}, nil)
+}
+
+func (self *SHuaweiClient) vpcDelete(regionId, resource string) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://vpc.%s.myhuaweicloud.com/v1/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.DELETE, uri, url.Values{}, nil)
+}
+
+func (self *SHuaweiClient) vpcUpdate(regionId, resource string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("https://vpc.%s.myhuaweicloud.com/v1/%s/%s", regionId, self.projectId, resource)
+	return self.request(httputils.PUT, uri, url.Values{}, params)
+}
+
+type akClient struct {
+	client *http.Client
+	aksk   aksk.SignOptions
+}
+
+func (self *akClient) Do(req *http.Request) (*http.Response, error) {
+	req.Header.Del("Accept")
+	if req.Method == string(httputils.GET) || req.Method == string(httputils.DELETE) {
+		req.Header.Del("Content-Length")
+	}
+	aksk.Sign(req, self.aksk)
+	return self.client.Do(req)
+}
+
+func (self *SHuaweiClient) getAkClient() *akClient {
+	return &akClient{
+		client: self.getDefaultClient(),
+		aksk: aksk.SignOptions{
+			AccessKey: self.accessKey,
+			SecretKey: self.accessSecret,
+		},
+	}
+}
+
+func (self *SHuaweiClient) request(method httputils.THttpMethod, url string, query url.Values, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	client := self.getAkClient()
+	if len(query) > 0 {
+		url = fmt.Sprintf("%s?%s", url, query.Encode())
+	}
+	var body jsonutils.JSONObject = nil
+	if len(params) > 0 {
+		body = jsonutils.Marshal(params)
+	}
+	header := http.Header{}
+	if len(self.projectId) > 0 {
+		header.Set("X-Project-Id", self.projectId)
+	}
+	_, resp, err := httputils.JSONRequest(client, context.Background(), method, url, header, body, self.debug)
 	if err != nil {
+		if e, ok := err.(*httputils.JSONClientError); ok && e.Code == 404 {
+			return nil, errors.Wrapf(cloudprovider.ErrNotFound, err.Error())
+		}
 		return nil, err
 	}
-
-	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
-	cli.SetHttpClient(httpClient)
-
-	return cli, nil
+	return resp, err
 }
 
 func (self *SHuaweiClient) fetchRegions() error {
@@ -250,9 +382,33 @@ func getOBSEndpoint(regionId string) string {
 	return fmt.Sprintf("obs.%s.myhuaweicloud.com", regionId)
 }
 
-func (client *SHuaweiClient) getOBSClient(regionId string) (*obs.ObsClient, error) {
+func (self *SHuaweiClient) getOBSClient(regionId string) (*obs.ObsClient, error) {
 	endpoint := getOBSEndpoint(regionId)
-	return obs.New(client.accessKey, client.accessSecret, endpoint)
+	cli, err := obs.New(self.accessKey, self.accessSecret, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client := cli.GetClient()
+	ts, _ := client.Transport.(*http.Transport)
+	client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		method, path := req.Method, req.URL.Path
+		respCheck := func(resp *http.Response) {
+			if resp.StatusCode == 403 {
+				if self.cpcfg.UpdatePermission != nil {
+					self.cpcfg.UpdatePermission("obs", fmt.Sprintf("%s %s", method, path))
+				}
+			}
+		}
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" || req.Method == "HEAD" {
+				return respCheck, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return respCheck, nil
+	})
+
+	return cli, nil
 }
 
 func (self *SHuaweiClient) fetchBuckets() error {

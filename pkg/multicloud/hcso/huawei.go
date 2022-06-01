@@ -16,6 +16,7 @@ package hcso
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -154,6 +155,16 @@ func (self *SHuaweiClient) newRegionAPIClient(regionId string) (*client.Client, 
 	}
 
 	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
+	ts, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
 	cli.SetHttpClient(httpClient)
 
 	return cli, nil
@@ -166,6 +177,16 @@ func (self *SHuaweiClient) newGeneralAPIClient() (*client.Client, error) {
 	}
 
 	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
+	ts, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
 	cli.SetHttpClient(httpClient)
 
 	return cli, nil

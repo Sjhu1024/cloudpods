@@ -190,11 +190,11 @@ func (self *SBaseGuestDriver) RequestDeleteDetachedDisk(ctx context.Context, dis
 	return fmt.Errorf("Not Implement")
 }
 
-func (self *SBaseGuestDriver) RqeuestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+func (self *SBaseGuestDriver) RequestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement")
 }
 
-func (self *SBaseGuestDriver) RqeuestResumeOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+func (self *SBaseGuestDriver) RequestResumeOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement")
 }
 
@@ -280,7 +280,7 @@ func (self *SBaseGuestDriver) IsSupportPostpaidExpire() bool {
 	return true
 }
 
-func (self *SBaseGuestDriver) RequestRenewInstance(guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
+func (self *SBaseGuestDriver) RequestRenewInstance(ctx context.Context, guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
 	return time.Time{}, nil
 }
 
@@ -452,4 +452,12 @@ func (self *SBaseGuestDriver) RequestChangeDiskStorage(ctx context.Context, user
 func (self *SBaseGuestDriver) RequestSyncIsolatedDevice(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	task.ScheduleRun(nil)
 	return nil
+}
+
+func (self *SBaseGuestDriver) RequestCPUSet(ctx context.Context, userCred mcclient.TokenCredential, host *models.SHost, guest *models.SGuest, input *api.ServerCPUSetInput) (*api.ServerCPUSetResp, error) {
+	return nil, httperrors.ErrNotImplemented
+}
+
+func (self *SBaseGuestDriver) RequestCPUSetRemove(ctx context.Context, userCred mcclient.TokenCredential, host *models.SHost, guest *models.SGuest, input *api.ServerCPUSetRemoveInput) error {
+	return httperrors.ErrNotImplemented
 }

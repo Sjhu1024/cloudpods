@@ -158,6 +158,16 @@ func (self *SAzureClient) getClient(resource TAzureResource) (*autorest.Client, 
 	}
 
 	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
+	transport, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		if self.cpcfg.ReadOnly {
+			if req.Method == "GET" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
 	client.Sender = httpClient
 
 	self.env = env
@@ -433,7 +443,7 @@ func (self *SAzureClient) _apiVersion(resource string, params url.Values) string
 			return "2020-06-01"
 		}
 		if utils.IsInStringArray("virtualmachines", info) {
-			return "2018-04-01"
+			return "2021-11-01"
 		}
 		if utils.IsInStringArray("skus", info) {
 			return "2019-04-01"
@@ -577,6 +587,10 @@ func (self *SAzureClient) ListResourceGroups() ([]SResourceGroup, error) {
 	err := self.list("resourcegroups", url.Values{}, &resourceGroups)
 	if err != nil {
 		return nil, errors.Wrap(err, "list")
+	}
+	for i := range resourceGroups {
+		resourceGroups[i].client = self
+		resourceGroups[i].subId = self.subscriptionId
 	}
 	return resourceGroups, nil
 }
@@ -914,10 +928,16 @@ func (self *SAzureClient) GetIStorageById(id string) (cloudprovider.ICloudStorag
 }
 
 func getResourceGroup(id string) string {
-	if info := strings.Split(id, "/resourceGroups/"); len(info) == 2 {
-		if resourcegroupInfo := strings.Split(info[1], "/"); len(resourcegroupInfo) > 0 {
-			return strings.ToLower(resourcegroupInfo[0])
+	info := strings.Split(strings.ToLower(id), "/")
+	idx := -1
+	for i := range info {
+		if info[i] == "resourcegroups" {
+			idx = i + 1
+			break
 		}
+	}
+	if idx > 0 && idx < len(info)-1 {
+		return info[idx]
 	}
 	return ""
 }

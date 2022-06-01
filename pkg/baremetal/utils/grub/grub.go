@@ -16,9 +16,12 @@ package grub
 
 import "fmt"
 
-func GetYunionOSConfig(sleepTime int, kernel string, kernelArgs string, initrd string) string {
+func GetYunionOSConfig(sleepTime int, httpSite, kernel string, kernelArgs string, initrd string) string {
+	kernel = fmt.Sprintf("(http,${http_site})/tftp/%s", kernel)
+	initrd = fmt.Sprintf("(http,${http_site})/tftp/%s", initrd)
 	return fmt.Sprintf(`
 set timeout=%d
+set http_site=%s
 menuentry 'YunionOS for PXE' --class os {
 	echo "Loading linux %s ..."
 	linux %s %s
@@ -26,7 +29,7 @@ menuentry 'YunionOS for PXE' --class os {
 	echo "Loading initrd %s ..."
 	initrd %s
 }
-`, sleepTime, kernel, kernel, kernelArgs, initrd, initrd)
+`, sleepTime, httpSite, kernel, kernel, kernelArgs, initrd, initrd)
 }
 
 // REF: https://github.com/bluebanquise/infrastructure/blob/master/packages/ipxe-bluebanquise/grub2-efi-autofind.cfg
@@ -40,12 +43,12 @@ insmod ext2
 insmod xfs
 echo
 echo "Scanning, first pass..."
-for cfg in (*,gpt*)/efi/*/grub.cfg (*,gpt*)/efi/*/*/grub.cfg (*,gpt*)/grub.cfg (*,gpt*)/*/grub.cfg (*,gpt*)/*/*/grub.cfg; do
+for cfg in (*,gpt*)/efi/*/grub.cfg (*,gpt*)/efi/*/*/grub.cfg (*,gpt*)/grub.cfg (*,gpt*)/*/grub.cfg (*,gpt*)/*/*/grub.cfg (*,msdos*)/grub.cfg (*,msdos*)/*/grub.cfg (*,mosdos*)/*/*/grub.cfg; do
 	regexp --set=1:cfg_device '^\((.*)\)/' "${cfg}"
 done
 
 echo "Scanning, second pass..."
-for cfg in (*,gpt*)/efi/*/grub.cfg (*,gpt*)/efi/*/*/grub.cfg (*,gpt*)/grub.cfg (*,gpt*)/*/grub.cfg (*,gpt*)/*/*/grub.cfg; do
+for cfg in (*,gpt*)/efi/*/grub.cfg (*,gpt*)/efi/*/*/grub.cfg (*,gpt*)/grub.cfg (*,gpt*)/*/grub.cfg (*,gpt*)/*/*/grub.cfg (*,msdos*)/grub.cfg (*,msdos*)/*/grub.cfg (*,mosdos*)/*/*/grub.cfg; do
 	regexp --set=1:cfg_device '^\((.*)\)/' "${cfg}"
 	echo "Try configfile ${cfg}"
 	if [ -e "${cfg}" ]; then

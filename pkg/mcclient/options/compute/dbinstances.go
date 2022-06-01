@@ -43,6 +43,7 @@ type DBInstanceCreateOptions struct {
 	AllowDelete        *bool    `help:"not lock dbinstance" `
 	Tags               []string `help:"Tags info,prefix with 'user:', eg: user:project=default" json:"-"`
 	DBInstancebackupId string   `help:"create dbinstance from backup" json:"dbinstancebackup_id"`
+	MultiAz            bool     `help:"deploy rds with multi az"`
 }
 
 func (opts *DBInstanceCreateOptions) Params() (jsonutils.JSONObject, error) {
@@ -74,6 +75,7 @@ func (opts *DBInstanceCreateOptions) Params() (jsonutils.JSONObject, error) {
 type DBInstanceListOptions struct {
 	options.BaseListOptions
 	BillingType string `help:"billing type" choices:"postpaid|prepaid"`
+	IpAddr      string
 }
 
 func (opts *DBInstanceListOptions) Params() (jsonutils.JSONObject, error) {

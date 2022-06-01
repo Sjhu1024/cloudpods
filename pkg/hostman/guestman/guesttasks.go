@@ -96,6 +96,74 @@ func (s *SGuestStopTask) CheckGuestRunningLater() {
 	s.checkGuestRunning()
 }
 
+type SGuestSuspendTask struct {
+	*SKVMGuestInstance
+	ctx              context.Context
+	onFinishCallback func(*SGuestSuspendTask, string)
+}
+
+func NewGuestSuspendTask(
+	guest *SKVMGuestInstance,
+	ctx context.Context,
+	onFinishCallback func(*SGuestSuspendTask, string),
+) *SGuestSuspendTask {
+	t := &SGuestSuspendTask{
+		SKVMGuestInstance: guest,
+		ctx:               ctx,
+	}
+	if onFinishCallback == nil {
+		onFinishCallback = t.onSaveMemStateComplete
+	}
+	t.onFinishCallback = onFinishCallback
+	return t
+}
+
+func (s *SGuestSuspendTask) Start() {
+	s.Monitor.SimpleCommand("stop", s.onSuspendGuest)
+}
+
+func (s *SGuestSuspendTask) GetStateFilePath() string {
+	return s.SKVMGuestInstance.GetStateFilePath("")
+}
+
+func (s *SGuestSuspendTask) onSuspendGuest(results string) {
+	if strings.Contains(strings.ToLower(results), "error") {
+		hostutils.TaskFailed(s.ctx, fmt.Sprintf("Suspend error: %s", results))
+		return
+	}
+	statFile := s.GetStateFilePath()
+	s.Monitor.SaveState(statFile, s.onSaveMemStateWait)
+}
+
+func (s *SGuestSuspendTask) onSaveMemStateWait(results string) {
+	if strings.Contains(strings.ToLower(results), "error") {
+		hostutils.TaskFailed(s.ctx, fmt.Sprintf("Save memory state error: %s", results))
+		// TODO: send cont command
+		return
+	}
+	s.Monitor.GetMigrateStatus(s.onSaveMemStateCheck)
+}
+
+func (s *SGuestSuspendTask) onSaveMemStateCheck(status string) {
+	if status == "failed" {
+		hostutils.TaskFailed(s.ctx, fmt.Sprintf("Save memory state failed"))
+		// TODO: send cont command
+		return
+	} else if status != "completed" {
+		time.Sleep(time.Second * 3)
+		log.Infof("Server %s saving memory state status %q", s.GetName(), status)
+		s.onSaveMemStateWait("")
+	} else {
+		log.Infof("Server %s save memory completed", s.GetName())
+		s.onFinishCallback(s, s.GetStateFilePath())
+	}
+}
+
+func (s *SGuestSuspendTask) onSaveMemStateComplete(_ *SGuestSuspendTask, _ string) {
+	log.Infof("Server %s memory state saved, stopping server", s.GetName())
+	s.ExecStopTask(s.ctx, int64(3))
+}
+
 /**
  *  GuestSyncConfigTaskExecutor
 **/
@@ -291,6 +359,14 @@ func (d *SGuestDiskSyncTask) startAddDisk(disk jsonutils.JSONObject) {
 		"id":    fmt.Sprintf("drive_%d", diskIndex),
 		"cache": cacheMode,
 		"aio":   aio,
+	}
+
+	if iDisk.IsFile() {
+		params["file.locking"] = "off"
+	}
+	if d.guest.isEncrypted() {
+		params["encrypt.format"] = "luks"
+		params["encrypt.key-secret"] = "sec0"
 	}
 
 	var bus string
@@ -700,7 +776,11 @@ func (s *SGuestLiveMigrateTask) doMigrate() {
 		copyIncremental = true
 	}
 	s.Monitor.Migrate(fmt.Sprintf("tcp:%s:%d", s.params.DestIp, s.params.DestPort),
-		copyIncremental, false, s.startMigrateStatusCheck)
+		copyIncremental, false, s.onSetMigrateDowntime)
+}
+
+func (s *SGuestLiveMigrateTask) onSetMigrateDowntime(res string) {
+	s.Monitor.MigrateSetParameter("downtime-limit", int(options.HostOptions.DefaultLiveMigrateDowntime*1000), s.startMigrateStatusCheck)
 }
 
 func (s *SGuestLiveMigrateTask) startMigrateStatusCheck(res string) {
@@ -782,6 +862,8 @@ type SGuestResumeTask struct {
 
 	isTimeout bool
 	cleanTLS  bool
+
+	getTaskData func() (jsonutils.JSONObject, error)
 }
 
 func NewGuestResumeTask(ctx context.Context, s *SKVMGuestInstance, isTimeout bool, cleanTLS bool) *SGuestResumeTask {
@@ -790,6 +872,7 @@ func NewGuestResumeTask(ctx context.Context, s *SKVMGuestInstance, isTimeout boo
 		ctx:               ctx,
 		isTimeout:         isTimeout,
 		cleanTLS:          cleanTLS,
+		getTaskData:       nil,
 	}
 }
 
@@ -808,6 +891,10 @@ func (s *SGuestResumeTask) Start() {
 		return
 	}
 	s.confirmRunning()
+}
+
+func (s *SGuestResumeTask) GetStateFilePath() string {
+	return s.SKVMGuestInstance.GetStateFilePath("")
 }
 
 func (s *SGuestResumeTask) Stop() {
@@ -879,9 +966,25 @@ func (s *SGuestResumeTask) onResumeSucc(res string) {
 	s.confirmRunning()
 }
 
+func (s *SGuestResumeTask) SetGetTaskData(f func() (jsonutils.JSONObject, error)) {
+	s.getTaskData = f
+}
+
 func (s *SGuestResumeTask) onStartRunning() {
+	s.removeStatefile()
 	if s.ctx != nil && len(appctx.AppContextTaskId(s.ctx)) > 0 {
-		hostutils.TaskComplete(s.ctx, nil)
+		var (
+			data jsonutils.JSONObject
+			err  error
+		)
+		if s.getTaskData != nil {
+			data, err = s.getTaskData()
+			if err != nil {
+				s.taskFailed(err.Error())
+				return
+			}
+		}
+		hostutils.TaskComplete(s.ctx, data)
 	}
 	if options.HostOptions.SetVncPassword {
 		s.SetVncPassword()
@@ -895,7 +998,10 @@ func (s *SGuestResumeTask) onStartRunning() {
 
 	disksIdx := s.GetNeedMergeBackingFileDiskIndexs()
 	if len(disksIdx) > 0 {
-		s.startStreamDisks(disksIdx)
+		s.SyncStatus("")
+		timeutils2.AddTimeout(
+			time.Second*time.Duration(options.HostOptions.AutoMergeDelaySeconds),
+			func() { s.startStreamDisks(disksIdx) })
 	} else if options.HostOptions.AutoMergeBackingTemplate {
 		s.SyncStatus("")
 		timeutils2.AddTimeout(
@@ -1136,7 +1242,12 @@ func (s *SGuestReloadDiskTask) getDiskOfDrive(block monitor.QemuBlock) string {
 	if len(block.Inserted.File) == 0 {
 		return ""
 	}
-	if block.Inserted.File == s.disk.GetPath() {
+	filePath, err := qemuimg.ParseQemuFilepath(block.Inserted.File)
+	if err != nil {
+		log.Errorf("qemuimg.ParseQemuFilepath %s fail %s", block.Inserted.File, err)
+		return ""
+	}
+	if filePath == s.disk.GetPath() {
 		return block.Device
 	}
 	return ""
@@ -1148,7 +1259,11 @@ func (s *SGuestReloadDiskTask) startReloadDisk(device string) {
 
 func (s *SGuestReloadDiskTask) doReloadDisk(device string, callback func(string)) {
 	s.Monitor.SimpleCommand("stop", func(string) {
-		s.Monitor.ReloadDiskBlkdev(device, s.disk.GetPath(), callback)
+		path := s.disk.GetPath()
+		if s.isEncrypted() {
+			path = qemuimg.GetQemuFilepath(path, "sec0", qemuimg.EncryptFormatLuks)
+		}
+		s.Monitor.ReloadDiskBlkdev(device, path, callback)
 	})
 }
 
@@ -1266,7 +1381,7 @@ func (s *SGuestSnapshotDeleteTask) doDiskConvert() error {
 		return err
 	}
 	convertedDisk := snapshotPath + ".tmp"
-	if err = img.Convert2Qcow2To(convertedDisk, true); err != nil {
+	if err = img.Convert2Qcow2To(convertedDisk, true, "", "", ""); err != nil {
 		log.Errorln(err)
 		if fileutils2.Exists(convertedDisk) {
 			os.Remove(convertedDisk)

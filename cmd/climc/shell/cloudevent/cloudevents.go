@@ -15,8 +15,10 @@
 package cloudevent
 
 import (
+	"yunion.io/x/jsonutils"
+
 	"yunion.io/x/onecloud/pkg/mcclient"
-	modules "yunion.io/x/onecloud/pkg/mcclient/modules/cloudevent"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/cloudevent"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
 )
 
@@ -33,25 +35,35 @@ func init() {
 		if err != nil {
 			return err
 		}
-		result, err := modules.Cloudevents.List(s, params)
+		result, err := cloudevent.Cloudevents.List(s, params)
 		if err != nil {
 			return err
 		}
-		printList(result, modules.Cloudevents.GetColumns(s))
+		printList(result, cloudevent.Cloudevents.GetColumns(s))
+		return nil
+	})
+
+	type CloudeventSplitTableOptions struct {
+	}
+
+	R(&CloudeventSplitTableOptions{}, "cloud-event-splitable", "Show obsolete cloud event logs", func(s *mcclient.ClientSession, opts *CloudeventSplitTableOptions) error {
+		resp, err := cloudevent.Cloudevents.Get(s, "splitable", nil)
+		if err != nil {
+			return err
+		}
+		printObject(resp)
 		return nil
 	})
 
 	type CloudeventLogsPurgeOptions struct {
+		Tables []string
 	}
-	R(&CloudeventLogsPurgeOptions{}, "cloud-event-purge", "Purge obsolete cloud event logs", func(s *mcclient.ClientSession, opts *CloudeventLogsPurgeOptions) error {
-		_, err := modules.Cloudevents.PerformClassAction(s, "purge-splitable", nil)
+	R(&CloudeventLogsPurgeOptions{}, "cloud-event-purge-splitable", "Purge obsolete cloud event logs", func(s *mcclient.ClientSession, opts *CloudeventLogsPurgeOptions) error {
+		resp, err := cloudevent.Cloudevents.PerformClassAction(s, "purge-splitable", jsonutils.Marshal(opts))
 		if err != nil {
 			return err
 		}
-		_, err = modules.CloudeventLogs.PerformClassAction(s, "purge-splitable", nil)
-		if err != nil {
-			return err
-		}
+		printObject(resp)
 		return nil
 	})
 }

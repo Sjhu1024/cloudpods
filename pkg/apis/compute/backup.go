@@ -14,11 +14,16 @@
 
 package compute
 
-import "yunion.io/x/onecloud/pkg/apis"
+import (
+	"yunion.io/x/jsonutils"
+
+	"yunion.io/x/onecloud/pkg/apis"
+)
 
 const (
-	BACKUPSTORAGE_TYPE_NFS      = "nfs"
-	BACKUPSTORAGE_STATUS_ONLINE = "online"
+	BACKUPSTORAGE_TYPE_NFS       = "nfs"
+	BACKUPSTORAGE_STATUS_ONLINE  = "online"
+	BACKUPSTORAGE_STATUS_OFFLINE = "offline"
 
 	BACKUP_STATUS_CREATING                = "creating"
 	BACKUP_STATUS_CREATE_FAILED           = "create_failed"
@@ -37,6 +42,10 @@ const (
 
 	BACKUP_EXIST     = "exist"
 	BACKUP_NOT_EXIST = "not_exist"
+)
+
+const (
+	BackupStorageOffline = "backup storage offline"
 )
 
 type BackupStorageCreateInput struct {
@@ -90,6 +99,7 @@ type DiskBackupDetails struct {
 	apis.VirtualResourceDetails
 	ManagedResourceInfo
 	CloudregionResourceInfo
+	apis.EncryptedResourceDetails
 
 	// description: disk name
 	DiskName string `json:"disk_name"`
@@ -101,6 +111,7 @@ type DiskBackupDetails struct {
 
 type DiskBackupCreateInput struct {
 	apis.VirtualResourceCreateInput
+	apis.EncryptedResourceCreateInput
 
 	// description: disk id
 	DiskId string `json:"disk_id"`
@@ -118,4 +129,34 @@ type DiskBackupRecoveryInput struct {
 }
 
 type DiskBackupSyncstatusInput struct {
+}
+
+type DiskBackupPackMetadata struct {
+	OsArch     string
+	SizeMb     int
+	DiskSizeMb int
+	DiskType   string
+	// 操作系统类型
+	OsType     string
+	DiskConfig *SBackupDiskConfig
+}
+
+type InstanceBackupPackMetadata struct {
+	OsArch         string
+	ServerConfig   jsonutils.JSONObject
+	ServerMetadata jsonutils.JSONObject
+	SecGroups      jsonutils.JSONObject
+	KeypairId      string
+	OsType         string
+	InstanceType   string
+	SizeMb         int
+	DiskMetadatas  []DiskBackupPackMetadata
+
+	// 加密密钥ID
+	EncryptKeyId string
+	// Instance Backup metadata
+	Metadata map[string]string `json:"metadata"`
+}
+
+type InstanceBackupManagerSyncstatusInput struct {
 }

@@ -26,7 +26,8 @@ type GatewayOptions struct {
 
 	DisableModuleApiVersion bool `help:"Disable each modules default api version" default:"false"`
 
-	EnableTotp bool `help:"Enable two-factor authentication" default:"false"`
+	EnableTotp bool   `help:"Enable two-factor authentication" default:"false"`
+	TotpIssuer string `help:"TOTP issuer" default:"Cloudpods"`
 
 	SsoRedirectUrl     string `help:"SSO idp redirect URL"`
 	SsoAuthCallbackUrl string `help:"SSO idp auth callback URL"`
@@ -38,6 +39,9 @@ type GatewayOptions struct {
 	ReturnFullDomainList bool `default:"true" help:"return domain list for get_regions API"`
 
 	SessionLevelAuthCookie bool `default:"false" help:"YunionAuth cookie is valid during a browser session"`
+
+	// 上报非敏感基础信息，帮助软件更加完善
+	DisableReporting bool `default:"false" help:"Reporting data every 24 hours, report data incloud version, os, platform and usages"`
 
 	common_options.CommonOptions `"request_worker_count->default":"32"`
 }

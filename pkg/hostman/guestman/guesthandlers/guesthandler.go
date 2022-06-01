@@ -25,16 +25,18 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	hostapi "yunion.io/x/onecloud/pkg/apis/host"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/hostman/guestman"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 )
 
 type strDict map[string]string
-type actionFunc func(context.Context, string, jsonutils.JSONObject) (interface{}, error)
+type actionFunc func(context.Context, mcclient.TokenCredential, string, jsonutils.JSONObject) (interface{}, error)
 
 var (
 	keyWords = []string{"servers"}
@@ -59,48 +61,57 @@ func AddGuestTaskHandler(prefix string, app *appsrv.Application) {
 			auth.Authenticate(deleteGuest))
 
 		for action, f := range map[string]actionFunc{
-			"create":               guestCreate,
-			"deploy":               guestDeploy,
-			"rebuild":              guestRebuild,
-			"start":                guestStart,
-			"stop":                 guestStop,
-			"monitor":              guestMonitor,
-			"sync":                 guestSync,
-			"suspend":              guestSuspend,
-			"io-throttle":          guestIoThrottle,
-			"snapshot":             guestSnapshot,
-			"delete-snapshot":      guestDeleteSnapshot,
-			"reload-disk-snapshot": guestReloadDiskSnapshot,
-			"src-prepare-migrate":  guestSrcPrepareMigrate,
-			"dest-prepare-migrate": guestDestPrepareMigrate,
-			"live-migrate":         guestLiveMigrate,
-			"resume":               guestResume,
-			"drive-mirror":         guestDriveMirror,
-			"hotplug-cpu-mem":      guestHotplugCpuMem,
-			"cancel-block-jobs":    guestCancelBlockJobs,
-			"create-from-libvirt":  guestCreateFromLibvirt,
-			"create-form-esxi":     guestCreateFromEsxi,
-			"open-forward":         guestOpenForward,
-			"list-forward":         guestListForward,
-			"close-forward":        guestCloseForward,
-			"storage-clone-disk":   guestStorageCloneDisk,
+			"create":                guestCreate,
+			"deploy":                guestDeploy,
+			"rebuild":               guestRebuild,
+			"start":                 guestStart,
+			"stop":                  guestStop,
+			"monitor":               guestMonitor,
+			"sync":                  guestSync,
+			"suspend":               guestSuspend,
+			"io-throttle":           guestIoThrottle,
+			"snapshot":              guestSnapshot,
+			"delete-snapshot":       guestDeleteSnapshot,
+			"reload-disk-snapshot":  guestReloadDiskSnapshot,
+			"src-prepare-migrate":   guestSrcPrepareMigrate,
+			"dest-prepare-migrate":  guestDestPrepareMigrate,
+			"live-migrate":          guestLiveMigrate,
+			"resume":                guestResume,
+			"drive-mirror":          guestDriveMirror,
+			"hotplug-cpu-mem":       guestHotplugCpuMem,
+			"cancel-block-jobs":     guestCancelBlockJobs,
+			"create-from-libvirt":   guestCreateFromLibvirt,
+			"create-form-esxi":      guestCreateFromEsxi,
+			"open-forward":          guestOpenForward,
+			"list-forward":          guestListForward,
+			"close-forward":         guestCloseForward,
+			"storage-clone-disk":    guestStorageCloneDisk,
+			"cpuset":                guestCPUSet,
+			"cpuset-remove":         guestCPUSetRemove,
+			"memory-snapshot":       guestMemorySnapshot,
+			"memory-snapshot-reset": guestMemorySnapshotReset,
 		} {
 			app.AddHandler("POST",
 				fmt.Sprintf("%s/%s/<sid>/%s", prefix, keyWord, action),
 				auth.Authenticate(guestActions(f)),
 			)
 		}
+
+		app.AddHandler("DELETE",
+			fmt.Sprintf("%s/%s/memory-snapshot", prefix, keyWord),
+			auth.Authenticate(guestMemorySnapshotDelete))
 	}
 }
 
 func guestActions(f actionFunc) appsrv.FilterHandler {
 	return func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 		params, _, body := appsrv.FetchEnv(ctx, w, r)
+		userCred := auth.FetchUserCredential(ctx, nil)
 		if body == nil {
 			body = jsonutils.NewDict()
 		}
 		var sid = params["<sid>"]
-		res, err := f(ctx, sid, body)
+		res, err := f(ctx, userCred, sid, body)
 		if err != nil {
 			hostutils.Response(ctx, w, err)
 		} else if res != nil {
@@ -139,13 +150,15 @@ func deleteGuest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func guestCreate(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestCreate(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewBadRequestError("Guest %s is exist", sid)
 	}
 	hostutils.DelayTaskWithWorker(ctx,
 		guestman.GetGuestManager().GuestCreate,
 		&guestman.SGuestDeploy{
+			UserCred: userCred,
+
 			Sid:    sid,
 			Body:   body,
 			IsInit: true,
@@ -155,7 +168,7 @@ func guestCreate(ctx context.Context, sid string, body jsonutils.JSONObject) (in
 	return nil, nil
 }
 
-func guestDeploy(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestDeploy(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	err := guestman.GetGuestManager().PrepareDeploy(sid)
 	if err != nil {
 		return nil, err
@@ -163,6 +176,8 @@ func guestDeploy(ctx context.Context, sid string, body jsonutils.JSONObject) (in
 	hostutils.DelayTaskWithWorker(ctx,
 		guestman.GetGuestManager().GuestDeploy,
 		&guestman.SGuestDeploy{
+			UserCred: userCred,
+
 			Sid:    sid,
 			Body:   body,
 			IsInit: false,
@@ -172,7 +187,7 @@ func guestDeploy(ctx context.Context, sid string, body jsonutils.JSONObject) (in
 	return nil, nil
 }
 
-func guestRebuild(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestRebuild(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	err := guestman.GetGuestManager().PrepareDeploy(sid)
 	if err != nil {
 		return nil, err
@@ -180,6 +195,8 @@ func guestRebuild(ctx context.Context, sid string, body jsonutils.JSONObject) (i
 	hostutils.DelayTaskWithWorker(ctx,
 		guestman.GetGuestManager().GuestDeploy,
 		&guestman.SGuestDeploy{
+			UserCred: userCred,
+
 			Sid:    sid,
 			Body:   body,
 			IsInit: true,
@@ -189,11 +206,11 @@ func guestRebuild(ctx context.Context, sid string, body jsonutils.JSONObject) (i
 	return nil, nil
 }
 
-func guestStart(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	return guestman.GetGuestManager().GuestStart(ctx, sid, body)
+func guestStart(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	return guestman.GetGuestManager().GuestStart(ctx, userCred, sid, body)
 }
 
-func guestStop(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestStop(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	timeout, err := body.Int("timeout")
 	if err != nil {
 		timeout = 30
@@ -201,7 +218,7 @@ func guestStop(ctx context.Context, sid string, body jsonutils.JSONObject) (inte
 	return nil, guestman.GetGuestManager().GuestStop(ctx, sid, timeout)
 }
 
-func guestMonitor(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestMonitor(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -226,7 +243,7 @@ func guestMonitor(ctx context.Context, sid string, body jsonutils.JSONObject) (i
 	}
 }
 
-func guestSync(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestSync(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -237,7 +254,7 @@ func guestSync(ctx context.Context, sid string, body jsonutils.JSONObject) (inte
 	return nil, nil
 }
 
-func guestSuspend(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestSuspend(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -245,7 +262,7 @@ func guestSuspend(ctx context.Context, sid string, body jsonutils.JSONObject) (i
 	return nil, nil
 }
 
-func guestIoThrottle(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestIoThrottle(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	guest, ok := guestman.GetGuestManager().GetServer(sid)
 	if !ok {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
@@ -269,7 +286,7 @@ func guestIoThrottle(ctx context.Context, sid string, body jsonutils.JSONObject)
 	return nil, nil
 }
 
-func guestSrcPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestSrcPrepareMigrate(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -284,26 +301,35 @@ func guestSrcPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSON
 	return nil, nil
 }
 
-func guestDestPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestDestPrepareMigrate(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	err := guestDestPrepareMigrateInternal(ctx, userCred, sid, body)
+	if err != nil {
+		guestman.GetGuestManager().CleanServer(sid)
+		return nil, errors.Wrapf(err, "guestDestPrepareMigrateInternal %s", sid)
+	}
+	return nil, nil
+}
+
+func guestDestPrepareMigrateInternal(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) error {
 	if !guestman.GetGuestManager().CanMigrate(sid) {
-		return nil, httperrors.NewBadRequestError("Guest exist")
+		return httperrors.NewBadRequestError("Guest exist")
 	}
 	desc, err := body.Get("desc")
 	if err != nil {
-		return nil, httperrors.NewMissingParameterError("desc")
+		return httperrors.NewMissingParameterError("desc")
 	}
 	qemuVersion, err := body.GetString("qemu_version")
 	if err != nil {
-		return nil, httperrors.NewMissingParameterError("qemu_version")
+		return httperrors.NewMissingParameterError("qemu_version")
 	}
 	liveMigrate := jsonutils.QueryBoolean(body, "live_migrate", false)
 	isLocal, err := body.Bool("is_local_storage")
 	if err != nil {
-		return nil, httperrors.NewMissingParameterError("is_local_storage")
+		return httperrors.NewMissingParameterError("is_local_storage")
 	}
 	qemuCmdline, err := body.GetString("qemu_cmdline")
 	if err != nil {
-		return nil, httperrors.NewMissingParameterError("qemu_cmdline")
+		return httperrors.NewMissingParameterError("qemu_cmdline")
 	}
 	var params = &guestman.SDestPrepareMigrate{}
 	params.Sid = sid
@@ -315,36 +341,36 @@ func guestDestPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSO
 	if params.EnableTLS {
 		certsObj, err := body.Get("migrate_certs")
 		if err != nil {
-			return nil, httperrors.NewMissingParameterError("migrate_certs")
+			return httperrors.NewMissingParameterError("migrate_certs")
 		}
 		certs := map[string]string{}
 		if err := certsObj.Unmarshal(&certs); err != nil {
-			return nil, httperrors.NewInputParameterError("unmarshal migrate_certs to map: %s", err)
+			return httperrors.NewInputParameterError("unmarshal migrate_certs to map: %s", err)
 		}
 		params.MigrateCerts = certs
 	}
 	if isLocal {
 		serverUrl, err := body.GetString("server_url")
 		if err != nil {
-			return nil, httperrors.NewMissingParameterError("server_url")
+			return httperrors.NewMissingParameterError("server_url")
 		} else {
 			params.ServerUrl = serverUrl
 		}
 		snapshotsUri, err := body.GetString("snapshots_uri")
 		if err != nil {
-			return nil, httperrors.NewMissingParameterError("snapshots_uri")
+			return httperrors.NewMissingParameterError("snapshots_uri")
 		} else {
 			params.SnapshotsUri = snapshotsUri
 		}
 		disksUri, err := body.GetString("disks_uri")
 		if err != nil {
-			return nil, httperrors.NewMissingParameterError("disks_uri")
+			return httperrors.NewMissingParameterError("disks_uri")
 		} else {
 			params.DisksUri = disksUri
 		}
 		srcSnapshots, err := body.Get("src_snapshots")
 		if err != nil {
-			return nil, httperrors.NewMissingParameterError("src_snapshots")
+			return httperrors.NewMissingParameterError("src_snapshots")
 		} else {
 			params.SrcSnapshots = srcSnapshots
 		}
@@ -356,13 +382,13 @@ func guestDestPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSO
 		}
 		disks, err := desc.GetArray("disks")
 		if err != nil {
-			return nil, httperrors.NewInputParameterError("Get desc disks error")
+			return httperrors.NewInputParameterError("Get desc disks error")
 		} else {
 			targetStorageIds := []string{}
 			for i := 0; i < len(disks); i++ {
 				targetStorageId, _ := disks[i].GetString("target_storage_id")
 				if len(targetStorageId) == 0 {
-					return nil, httperrors.NewMissingParameterError("target_storage_id")
+					return httperrors.NewMissingParameterError("target_storage_id")
 				}
 				targetStorageIds = append(targetStorageIds, targetStorageId)
 				// params.TargetStorageId = targetStorageId
@@ -372,11 +398,22 @@ func guestDestPrepareMigrate(ctx context.Context, sid string, body jsonutils.JSO
 		}
 		params.RebaseDisks = jsonutils.QueryBoolean(body, "rebase_disks", false)
 	}
+
+	msUri, err := body.GetString("memory_snapshots_uri")
+	if err != nil {
+		return httperrors.NewMissingParameterError("memory_snapshots_uri")
+	}
+	params.MemorySnapshotsUri = msUri
+	msIds, _ := jsonutils.GetStringArray(body, "src_memory_snapshots")
+	params.SrcMemorySnapshots = msIds
+
+	params.UserCred = userCred
+
 	hostutils.DelayTask(ctx, guestman.GetGuestManager().DestPrepareMigrate, params)
-	return nil, nil
+	return nil
 }
 
-func guestLiveMigrate(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestLiveMigrate(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -403,7 +440,7 @@ func guestLiveMigrate(ctx context.Context, sid string, body jsonutils.JSONObject
 	return nil, nil
 }
 
-func guestResume(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestResume(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -421,7 +458,7 @@ func guestResume(ctx context.Context, sid string, body jsonutils.JSONObject) (in
 // 	return nil, nil
 // }
 
-func guestDriveMirror(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestDriveMirror(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -442,7 +479,7 @@ func guestDriveMirror(ctx context.Context, sid string, body jsonutils.JSONObject
 	return nil, nil
 }
 
-func guestCancelBlockJobs(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestCancelBlockJobs(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -450,7 +487,7 @@ func guestCancelBlockJobs(ctx context.Context, sid string, body jsonutils.JSONOb
 	return nil, nil
 }
 
-func guestHotplugCpuMem(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestHotplugCpuMem(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	if !guestman.GetGuestManager().IsGuestExist(sid) {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -470,7 +507,7 @@ func guestHotplugCpuMem(ctx context.Context, sid string, body jsonutils.JSONObje
 	return nil, nil
 }
 
-func guestReloadDiskSnapshot(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestReloadDiskSnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	diskId, err := body.GetString("disk_id")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("disk_id")
@@ -501,7 +538,7 @@ func guestReloadDiskSnapshot(ctx context.Context, sid string, body jsonutils.JSO
 	return nil, nil
 }
 
-func guestSnapshot(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestSnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	snapshotId, err := body.GetString("snapshot_id")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("snapshot_id")
@@ -534,6 +571,7 @@ func guestSnapshot(ctx context.Context, sid string, body jsonutils.JSONObject) (
 	}
 
 	hostutils.DelayTask(ctx, guestman.GetGuestManager().DoSnapshot, &guestman.SDiskSnapshot{
+		UserCred:   userCred,
 		Sid:        sid,
 		SnapshotId: snapshotId,
 		Disk:       disk,
@@ -541,7 +579,7 @@ func guestSnapshot(ctx context.Context, sid string, body jsonutils.JSONObject) (
 	return nil, nil
 }
 
-func guestDeleteSnapshot(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestDeleteSnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	deleteSnapshot, err := body.GetString("delete_snapshot")
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("delete_snapshot")
@@ -594,7 +632,7 @@ func guestDeleteSnapshot(ctx context.Context, sid string, body jsonutils.JSONObj
 	return nil, nil
 }
 
-func guestStorageCloneDisk(ctx context.Context, sid string, body jsonutils.JSONObject) (interface{}, error) {
+func guestStorageCloneDisk(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
 	input := new(computeapi.ServerChangeDiskStorageInternalInput)
 	if err := body.Unmarshal(input); err != nil {
 		return nil, err
@@ -624,4 +662,74 @@ func guestStorageCloneDisk(ctx context.Context, sid string, body jsonutils.JSONO
 	}
 	hostutils.DelayTaskWithoutReqctx(ctx, guestman.GetGuestManager().StorageCloneDisk, params)
 	return nil, nil
+}
+
+func guestCPUSet(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	input := new(computeapi.ServerCPUSetInput)
+	if err := body.Unmarshal(input); err != nil {
+		return nil, err
+	}
+	gm := guestman.GetGuestManager()
+	return gm.CPUSet(ctx, sid, input)
+}
+
+func guestCPUSetRemove(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	gm := guestman.GetGuestManager()
+	if err := gm.CPUSetRemove(ctx, sid); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func guestMemorySnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	input := new(hostapi.GuestMemorySnapshotRequest)
+	if err := body.Unmarshal(input); err != nil {
+		return nil, err
+	}
+	gm := guestman.GetGuestManager()
+	hostutils.DelayTaskWithoutReqctx(ctx, gm.DoMemorySnapshot, &guestman.SMemorySnapshot{
+		GuestMemorySnapshotRequest: input,
+		Sid:                        sid,
+	})
+	return nil, nil
+}
+
+func guestMemorySnapshotReset(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	input := new(hostapi.GuestMemorySnapshotResetRequest)
+	if err := body.Unmarshal(input); err != nil {
+		return nil, err
+	}
+	if input.InstanceSnapshotId == "" {
+		return nil, httperrors.NewMissingParameterError("instance_snapshot_id")
+	}
+	if input.Path == "" {
+		return nil, httperrors.NewMissingParameterError("path")
+	}
+	gm := guestman.GetGuestManager()
+	hostutils.DelayTaskWithoutReqctx(ctx, gm.DoResetMemorySnapshot, &guestman.SMemorySnapshotReset{
+		GuestMemorySnapshotResetRequest: input,
+		Sid:                             sid,
+	})
+	return nil, nil
+}
+
+func guestMemorySnapshotDelete(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, _, body := appsrv.FetchEnv(ctx, w, r)
+	input := new(hostapi.GuestMemorySnapshotDeleteRequest)
+	if err := body.Unmarshal(input); err != nil {
+		hostutils.Response(ctx, w, err)
+		return
+	}
+	if input.InstanceSnapshotId == "" {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("instance_snapshot_id"))
+		return
+	}
+	if input.Path == "" {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("path"))
+		return
+	}
+	gm := guestman.GetGuestManager()
+	hostutils.DelayTask(ctx, gm.DoDeleteMemorySnapshot, &guestman.SMemorySnapshotDelete{
+		GuestMemorySnapshotDeleteRequest: input,
+	})
 }

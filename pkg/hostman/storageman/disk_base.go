@@ -19,14 +19,16 @@ import (
 	"fmt"
 	"path"
 
-	"github.com/pkg/errors"
-
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
+	"yunion.io/x/onecloud/pkg/util/qemuimg"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
 )
 
 type IDisk interface {
@@ -41,7 +43,7 @@ type IDisk interface {
 	OnRebuildRoot(ctx context.Context, params api.DiskAllocateInput) error
 	DoDeleteSnapshot(snapshotId string) error
 
-	DeleteAllSnapshot() error
+	DeleteAllSnapshot(skipRecycle bool) error
 	DiskSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 	DiskDeleteSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 	Delete(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
@@ -52,20 +54,22 @@ type IDisk interface {
 
 	PrepareMigrate(liveMigrate bool) (string, error)
 	CreateFromUrl(ctx context.Context, url string, size int64, callback func(progress, progressMbps float64, totalSizeMb int64)) error
-	CreateFromTemplate(context.Context, string, string, int64) (jsonutils.JSONObject, error)
+	CreateFromTemplate(context.Context, string, string, int64, *apis.SEncryptInfo) (jsonutils.JSONObject, error)
 	CreateFromSnapshotLocation(ctx context.Context, location string, size int64) error
 	CreateFromRbdSnapshot(ctx context.Context, snapshotId, srcDiskId, srcPool string) error
-	CreateFromImageFuse(ctx context.Context, url string, size int64) error
+	CreateFromImageFuse(ctx context.Context, url string, size int64, encryptInfo *apis.SEncryptInfo) error
 	CreateRaw(ctx context.Context, sizeMb int, diskFromat string, fsFormat string,
-		encryption bool, diskId string, back string) (jsonutils.JSONObject, error)
+		encryptInfo *apis.SEncryptInfo, diskId string, back string) (jsonutils.JSONObject, error)
 	PostCreateFromImageFuse()
-	CreateSnapshot(snapshotId string) error
+	CreateSnapshot(snapshotId string, encryptKey string, encFormat qemuimg.TEncryptFormat, encAlg seclib2.TSymEncAlg) error
 	DeleteSnapshot(snapshotId, convertSnapshot string, pendingDelete bool) error
-	DeployGuestFs(diskPath string, guestDesc *jsonutils.JSONDict,
+	DeployGuestFs(diskInfo *deployapi.DiskInfo, guestDesc *jsonutils.JSONDict,
 		deployInfo *deployapi.DeployInfo) (jsonutils.JSONObject, error)
 
 	GetBackupDir() string
 	DiskBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
+
+	IsFile() bool
 }
 
 type SBaseDisk struct {
@@ -104,7 +108,7 @@ func (d *SBaseDisk) CreateFromUrl(ctx context.Context, url string, size int64, c
 	return fmt.Errorf("Not implemented")
 }
 
-func (d *SBaseDisk) CreateFromTemplate(context.Context, string, string, int64) (jsonutils.JSONObject, error) {
+func (d *SBaseDisk) CreateFromTemplate(context.Context, string, string, int64, *apis.SEncryptInfo) (jsonutils.JSONObject, error) {
 	return nil, fmt.Errorf("Not implemented")
 }
 
@@ -116,11 +120,11 @@ func (d *SBaseDisk) Resize(context.Context, interface{}) (jsonutils.JSONObject, 
 	return nil, fmt.Errorf("Not implemented")
 }
 
-func (d *SBaseDisk) GetZoneName() string {
-	return d.Storage.GetZoneName()
+func (d *SBaseDisk) GetZoneId() string {
+	return d.Storage.GetZoneId()
 }
 
-func (d *SBaseDisk) DeployGuestFs(diskPath string, guestDesc *jsonutils.JSONDict,
+func (d *SBaseDisk) DeployGuestFs(diskInfo *deployapi.DiskInfo, guestDesc *jsonutils.JSONDict,
 	deployInfo *deployapi.DeployInfo) (jsonutils.JSONObject, error) {
 	deployGuestDesc, err := deployapi.GuestDescToDeployDesc(guestDesc)
 	if err != nil {
@@ -128,7 +132,7 @@ func (d *SBaseDisk) DeployGuestFs(diskPath string, guestDesc *jsonutils.JSONDict
 	}
 	ret, err := deployclient.GetDeployClient().DeployGuestFs(
 		context.Background(), &deployapi.DeployParams{
-			DiskPath:   diskPath,
+			DiskInfo:   diskInfo,
 			GuestDesc:  deployGuestDesc,
 			DeployInfo: deployInfo,
 		},
@@ -139,9 +143,9 @@ func (d *SBaseDisk) DeployGuestFs(diskPath string, guestDesc *jsonutils.JSONDict
 	return jsonutils.Marshal(ret), nil
 }
 
-func (d *SBaseDisk) ResizeFs(diskPath string) error {
+func (d *SBaseDisk) ResizeFs(diskInfo *deployapi.DiskInfo) error {
 	_, err := deployclient.GetDeployClient().ResizeFs(
-		context.Background(), &deployapi.ResizeFsParams{DiskPath: diskPath})
+		context.Background(), &deployapi.ResizeFsParams{DiskInfo: diskInfo})
 	return err
 }
 
@@ -153,12 +157,12 @@ func (d *SBaseDisk) GetSnapshotLocation() string {
 	return ""
 }
 
-func (d *SBaseDisk) FormatFs(fsFormat, uuid, diskPath string) {
+func (d *SBaseDisk) FormatFs(fsFormat, uuid string, diskInfo *deployapi.DiskInfo) {
 	log.Infof("Make disk %s fs %s", uuid, fsFormat)
 	_, err := deployclient.GetDeployClient().FormatFs(
 		context.Background(),
 		&deployapi.FormatFsParams{
-			DiskPath: diskPath,
+			DiskInfo: diskInfo,
 			FsFormat: fsFormat,
 			Uuid:     uuid,
 		},

@@ -291,7 +291,9 @@ func (as *SAgentStorage) AgentDeployGuest(ctx context.Context, data interface{})
 		desc, _ := dataDict.Get("desc")
 		guestDesc.Hypervisor = api.HYPERVISOR_ESXI
 		deploy, err = deployclient.GetDeployClient().DeployGuestFs(ctx, &deployapi.DeployParams{
-			DiskPath:  rootPath,
+			DiskInfo: &deployapi.DiskInfo{
+				Path: rootPath,
+			},
 			GuestDesc: &guestDesc,
 			DeployInfo: &deployapi.DeployInfo{
 				PublicKey:               &key,
@@ -508,8 +510,11 @@ func (as *SAgentStorage) SaveToGlance(ctx context.Context, params interface{}) (
 
 func (as *SAgentStorage) saveToGlance(ctx context.Context, imageId, imagePath string,
 	compress bool, format string) error {
+	diskInfo := &deployapi.DiskInfo{
+		Path: imagePath,
+	}
 	ret, err := deployclient.GetDeployClient().SaveToGlance(context.Background(),
-		&deployapi.SaveToGlanceParams{DiskPath: imagePath, Compress: compress})
+		&deployapi.SaveToGlanceParams{DiskInfo: diskInfo, Compress: compress})
 	if err != nil {
 		return errors.Wrap(err, "DeployClient.SaveToGlance")
 	}
@@ -523,8 +528,9 @@ func (as *SAgentStorage) saveToGlance(ctx context.Context, imageId, imagePath st
 		if len(format) == 0 {
 			format = options.HostOptions.DefaultImageSaveFormat
 		}
-		if format == "qcow2" {
-			if err := origin.Convert2Qcow2(true); err != nil {
+		if format == string(qemuimg.QCOW2) {
+			// may be encrypted
+			if err := origin.Convert2Qcow2(true, "", "", ""); err != nil {
 				log.Errorln(err)
 				return err
 			}
@@ -566,7 +572,7 @@ func (as *SAgentStorage) saveToGlance(ctx context.Context, imageId, imagePath st
 	}
 	params.Set("image_id", jsonutils.NewString(imageId))
 
-	_, err = modules.Images.Upload(hostutils.GetImageSession(ctx, as.agent.GetZoneName()),
+	_, err = modules.Images.Upload(hostutils.GetImageSession(ctx, as.agent.GetZoneId()),
 		params, f, size)
 	if err != nil {
 		return errors.Wrap(err, "Images.Upload")
@@ -577,7 +583,7 @@ func (as *SAgentStorage) saveToGlance(ctx context.Context, imageId, imagePath st
 func (as *SAgentStorage) onSaveToGlanceFailed(ctx context.Context, imageId string) {
 	params := jsonutils.NewDict()
 	params.Set("status", jsonutils.NewString("killed"))
-	_, err := modules.Images.Update(hostutils.GetImageSession(ctx, as.agent.GetZoneName()),
+	_, err := modules.Images.Update(hostutils.GetImageSession(ctx, as.agent.GetZoneId()),
 		imageId, params)
 	if err != nil {
 		log.Errorln(err)

@@ -50,7 +50,7 @@ func init() {
 	cmd.BatchPut(new(options.ServerUpdateOptions))
 	cmd.GetMetadata(new(options.ServerIdOptions))
 	cmd.Perform("clone", new(options.ServerCloneOptions))
-	cmd.BatchPerform("start", new(options.ServerIdsOptions))
+	cmd.BatchPerform("start", new(options.ServerStartOptions))
 	cmd.BatchPerform("syncstatus", new(options.ServerIdsOptions))
 	cmd.BatchPerform("sync", new(options.ServerIdsOptions))
 	cmd.Perform("switch-to-backup", new(options.ServerSwitchToBackupOptions))
@@ -100,6 +100,10 @@ func init() {
 	cmd.Perform("user-metadata", &baseoptions.ResourceMetadataOptions{})
 	cmd.Perform("set-user-metadata", &baseoptions.ResourceMetadataOptions{})
 	cmd.Perform("probe-isolated-devices", &options.ServerIdOptions{})
+	cmd.Perform("cpuset", &options.ServerCPUSetOptions{})
+	cmd.Perform("cpuset-remove", &options.ServerIdOptions{})
+	cmd.Perform("calculate-record-checksum", &options.ServerIdOptions{})
+	cmd.Perform("set-class-metadata", &baseoptions.ResourceMetadataOptions{})
 
 	cmd.Get("vnc", new(options.ServerIdOptions))
 	cmd.Get("desc", new(options.ServerIdOptions))
@@ -110,6 +114,10 @@ func init() {
 	cmd.Get("make-sshable-cmd", new(options.ServerIdOptions))
 	cmd.Get("change-owner-candidate-domains", new(options.ServerChangeOwnerCandidateDomainsOptions))
 	cmd.Get("change-owner-candidate-domains", new(options.ServerChangeOwnerCandidateDomainsOptions))
+	cmd.Get("cpuset-cores", new(options.ServerIdOptions))
+	cmd.Get("sshport", new(options.ServerIdOptions))
+	cmd.Get("qemu-info", new(options.ServerIdOptions))
+
 	cmd.GetProperty(&options.ServerStatusStatisticsOptions{})
 	cmd.GetProperty(&options.ServerProjectStatisticsOptions{})
 	cmd.GetProperty(&options.ServerDomainStatisticsOptions{})
@@ -235,19 +243,6 @@ func init() {
 		},
 	)
 
-	R(&options.ServerCreateOptions{}, "server-check-create-data", "Check create server data", func(s *mcclient.ClientSession, opts *options.ServerCreateOptions) error {
-		params, err := opts.Params()
-		if err != nil {
-			return err
-		}
-		server, err := modules.Servers.PerformClassAction(s, "check-create-data", params.JSON(params))
-		if err != nil {
-			return err
-		}
-		printObject(server)
-		return nil
-	})
-
 	R(&options.ServerCreateOptions{}, "server-create", "Create a server", func(s *mcclient.ClientSession, opts *options.ServerCreateOptions) error {
 		params, err := opts.Params()
 		if err != nil {
@@ -265,24 +260,24 @@ func init() {
 				return err
 			}
 			printList(modulebase.JSON2ListResult(result), listFields)
+			return nil
+		}
+		taskNotify := baseoptions.BoolV(opts.TaskNotify)
+		if taskNotify {
+			s.PrepareTask()
+		}
+		if count > 1 {
+			results := modules.Servers.BatchCreate(s, params.JSON(params), count)
+			printBatchResults(results, modules.Servers.GetColumns(s))
 		} else {
-			taskNotify := baseoptions.BoolV(opts.TaskNotify)
-			if taskNotify {
-				s.PrepareTask()
+			server, err := modules.Servers.Create(s, params.JSON(params))
+			if err != nil {
+				return err
 			}
-			if count > 1 {
-				results := modules.Servers.BatchCreate(s, params.JSON(params), count)
-				printBatchResults(results, modules.Servers.GetColumns(s))
-			} else {
-				server, err := modules.Servers.Create(s, params.JSON(params))
-				if err != nil {
-					return err
-				}
-				printObject(server)
-			}
-			if taskNotify {
-				s.WaitTaskNotify()
-			}
+			printObject(server)
+		}
+		if taskNotify {
+			s.WaitTaskNotify()
 		}
 		return nil
 	})
@@ -730,8 +725,9 @@ func init() {
 		return nil
 	})
 	type ServerCreateSnapshot struct {
-		ID       string `help:"ID or name of VM" json:"-"`
-		SNAPSHOT string `help:"Instance snapshot name" json:"name"`
+		ID         string `help:"ID or name of VM" json:"-"`
+		SNAPSHOT   string `help:"Instance snapshot name" json:"name"`
+		WithMemory bool   `help:"Save memory state" json:"with_memory"`
 	}
 	R(&ServerCreateSnapshot{}, "instance-snapshot-create", "create instance snapshot", func(s *mcclient.ClientSession, opts *ServerCreateSnapshot) error {
 		params := jsonutils.Marshal(opts)
@@ -747,7 +743,7 @@ func init() {
 		BACKUP          string `help:"Instance backup name" json:"name"`
 		BACKUPSTORAGEID string `help:"backup storage id" json:"backup_storage_id"`
 	}
-	R(&ServerCreateBackup{}, "instance-backup-create", "create instance backup", func(s *mcclient.ClientSession, opts *ServerCreateBackup) error {
+	R(&ServerCreateBackup{}, "server-create-instance-backup", "create instance backup", func(s *mcclient.ClientSession, opts *ServerCreateBackup) error {
 		params := jsonutils.Marshal(opts)
 		result, err := modules.Servers.PerformAction(s, opts.ID, "instance-backup", params)
 		if err != nil {
@@ -781,6 +777,7 @@ func init() {
 	type ServerRollBackSnapshot struct {
 		ID               string `help:"ID or name of VM" json:"-"`
 		InstanceSnapshot string `help:"Instance snapshot id or name" json:"instance_snapshot"`
+		WithMemory       bool   `help:"Memory restore" json:"with_memory"`
 		AutoStart        bool   `help:"Auto start VM"`
 	}
 	R(&ServerRollBackSnapshot{}, "instance-snapshot-reset", "reset instance snapshot", func(s *mcclient.ClientSession, opts *ServerRollBackSnapshot) error {

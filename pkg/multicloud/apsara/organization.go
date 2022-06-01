@@ -50,6 +50,26 @@ type SOrganization struct {
 	UUID              string
 }
 
+type ResourceGroupList []SResourceGroupList
+
+func (rgs ResourceGroupList) ToProjects(tags []string) []SProject {
+	ret := []SProject{}
+	for _, rg := range rgs {
+		name := rg.ResourceGroupName
+		if strings.HasPrefix(name, "ResourceSet(") {
+			name = strings.TrimPrefix(name, "ResourceSet(")
+			name = strings.TrimSuffix(name, ")")
+		}
+		proj := SProject{
+			Id:   rg.Id,
+			Name: name,
+			Tags: tags,
+		}
+		ret = append(ret, proj)
+	}
+	return ret
+}
+
 type SOrganizationTree struct {
 	Active            bool
 	Alias             string
@@ -58,7 +78,7 @@ type SOrganizationTree struct {
 	ParentId          string
 	MultiCCloudStatus string
 	Children          []SOrganizationTree
-	ResourceGroupList []SResourceGroupList
+	ResourceGroupList ResourceGroupList
 	SupportRegions    string
 	UUID              string
 }
@@ -68,18 +88,9 @@ func (self *SOrganizationTree) GetProject(tags []string) []SProject {
 	if self.Name != "root" {
 		tags = append(tags, self.Name)
 	}
+	ret = append(ret, self.ResourceGroupList.ToProjects(tags)...)
 	if len(self.Children) == 0 {
-		for _, resGrp := range self.ResourceGroupList {
-			if strings.HasPrefix(resGrp.ResourceGroupName, "ResourceSet(") {
-				continue
-			}
-			proj := SProject{
-				Id:   resGrp.Id,
-				Name: resGrp.ResourceGroupName,
-				Tags: tags,
-			}
-			ret = append(ret, proj)
-		}
+		return ret
 	}
 	for _, child := range self.Children {
 		ret = append(ret, child.GetProject(tags)...)
@@ -87,12 +98,12 @@ func (self *SOrganizationTree) GetProject(tags []string) []SProject {
 	return ret
 }
 
-func (self *SApsaraClient) GetOrganizationTree(id int) (*SOrganizationTree, error) {
-	if id == 0 {
-		id = 1
+func (self *SApsaraClient) GetOrganizationTree(id string) (*SOrganizationTree, error) {
+	if len(id) == 0 {
+		id = "1"
 	}
 	params := map[string]string{
-		"Id": fmt.Sprintf("%d", id),
+		"Id": id,
 	}
 	resp, err := self.ascmRequest("GetOrganizationTree", params)
 	if err != nil {
@@ -107,7 +118,7 @@ func (self *SApsaraClient) GetOrganizationTree(id int) (*SOrganizationTree, erro
 }
 
 func (self *SApsaraClient) GetOrganizationList() ([]SOrganization, error) {
-	params := map[string]string{"Id": "1"}
+	params := map[string]string{"Id": self.organizationId}
 	resp, err := self.ascmRequest("GetOrganizationList", params)
 	if err != nil {
 		return nil, err
@@ -133,7 +144,7 @@ func (self *SOrganizationTree) ListProjects() []SResourceGroupList {
 }
 
 type SProject struct {
-	multicloud.SResourceBase
+	multicloud.SProjectBase
 
 	client *SApsaraClient
 	Id     string
@@ -143,14 +154,6 @@ type SProject struct {
 
 func (self *SProject) GetId() string {
 	return self.Id
-}
-
-func (self *SProject) GetDomainId() string {
-	return ""
-}
-
-func (self *SProject) GetDomainName() string {
-	return ""
 }
 
 func (self *SProject) GetGlobalId() string {
@@ -182,7 +185,7 @@ func (self *SProject) GetTags() (map[string]string, error) {
 }
 
 func (self *SApsaraClient) GetIProjects() ([]cloudprovider.ICloudProject, error) {
-	tree, err := self.GetOrganizationTree(1)
+	tree, err := self.GetOrganizationTree(self.organizationId)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetOrganizationTree")
 	}

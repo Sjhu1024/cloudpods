@@ -15,6 +15,7 @@
 package core
 
 import (
+	"context"
 	"strings"
 
 	"yunion.io/x/jsonutils"
@@ -106,6 +107,8 @@ type CandidatePropertyGetter interface {
 	InstanceGroups() map[string]*api.CandidateGroup
 	GetFreeGroupCount(groupId string) (int, error)
 
+	GetAllClassMetadata() (map[string]string, error)
+
 	GetIpmiInfo() types.SIPMIInfo
 
 	GetNics() []*types.SNic
@@ -178,8 +181,8 @@ type FitPredicate interface {
 	// Get filter's name
 	Name() string
 	Clone() FitPredicate
-	PreExecute(*Unit, []Candidater) (bool, error)
-	Execute(*Unit, Candidater) (bool, []PredicateFailureReason, error)
+	PreExecute(context.Context, *Unit, []Candidater) (bool, error)
+	Execute(context.Context, *Unit, Candidater) (bool, []PredicateFailureReason, error)
 }
 
 type PredicateFailureError interface {

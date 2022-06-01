@@ -71,7 +71,7 @@ func StartService() error {
 		if count == checkDBSyncRetries {
 			log.Fatalf("database schema not in sync!!!")
 		}
-		if !db.CheckSync(false) {
+		if !db.CheckSync(false, false, true) {
 			log.Errorf("database schema not in sync, wait region sync database")
 			time.Sleep(2 * time.Second)
 		} else {
@@ -80,20 +80,20 @@ func StartService() error {
 		count++
 	}
 
-	if err := computemodels.InitDB(); err != nil {
-		log.Fatalf("InitDB fail: %s", err)
-	}
-
 	commonOpts := &opts.CommonOptions
 	app_common.InitAuth(commonOpts, func() {
 		log.Infof("Auth complete!!")
 		startSched()
 	})
 
+	if err := computemodels.InitDB(); err != nil {
+		log.Fatalf("InitDB fail: %s", err)
+	}
+
 	common_options.StartOptionManager(&opts, opts.ConfigSyncPeriodSeconds, compute_api.SERVICE_TYPE, compute_api.SERVICE_VERSION, o.OnOptionsChange)
 
 	app := app_common.InitApp(&opts.BaseOptions, true)
-	cloudcommon.AppDBInit(app)
+	db.AppDBInit(app)
 
 	//InitHandlers(app)
 	return startHTTP(opts)

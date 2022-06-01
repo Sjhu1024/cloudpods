@@ -231,34 +231,31 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 	}
 
 	// receiver
-	topics, err := TopicManager.TopicsByEvent(input.Event, input.AdvanceDays)
+	topic, err := TopicManager.TopicByEvent(input.Event, input.AdvanceDays)
 	if err != nil {
 		return output, errors.Wrapf(err, "unable fetch subscriptions by event %q", input.Event)
 	}
-	if len(topics) == 0 {
+	if topic == nil {
 		return output, nil
 	}
 	var receiverIds []string
-	for i := range topics {
-		receiverIds1, err := SubscriberManager.getReceiversSent(ctx, topics[i].Id, input.ProjectDomainId, input.ProjectId)
-		if err != nil {
-			return output, errors.Wrap(err, "unable to get receive")
-		}
-		receiverIds = append(receiverIds, receiverIds1...)
+	receiverIds1, err := SubscriberManager.getReceiversSent(ctx, topic.Id, input.ProjectDomainId, input.ProjectId)
+	if err != nil {
+		return output, errors.Wrap(err, "unable to get receive")
 	}
+	receiverIds = append(receiverIds, receiverIds1...)
 
 	// robot
 	var robots []string
-	for i := range topics {
-		_robots, err := SubscriberManager.robot(topics[i].Id, input.ProjectDomainId, input.ProjectId)
-		if err != nil {
-			if errors.Cause(err) != errors.ErrNotFound {
-				return output, errors.Wrapf(err, "unable fetch robot of subscription %q", topics[i].Id)
-			}
-		} else {
-			robots = append(robots, _robots...)
+	_robots, err := SubscriberManager.robot(topic.Id, input.ProjectDomainId, input.ProjectId)
+	if err != nil {
+		if errors.Cause(err) != errors.ErrNotFound {
+			return output, errors.Wrapf(err, "unable fetch robot of subscription %q", topic.Id)
 		}
+	} else {
+		robots = append(robots, _robots...)
 	}
+
 	var webhookRobots []string
 	if len(robots) > 0 {
 		robots = sets.NewString(robots...).UnsortedList()
@@ -299,13 +296,12 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 	receiverIds = idSet.UnsortedList()
 
 	// create event
-	event, err := EventManager.CreateEvent(ctx, input.Event, message, input.AdvanceDays)
+	event, err := EventManager.CreateEvent(ctx, input.Event, topic.Id, message, input.AdvanceDays)
 	if err != nil {
 		return output, errors.Wrap(err, "unable to create Event")
 	}
 
-	if nm.needWebconsole(topics) {
-
+	if nm.needWebconsole([]STopic{*topic}) {
 		// webconsole
 		err = nm.create(ctx, userCred, api.WEBCONSOLE, receiverIds, webconsoleContacts.UnsortedList(), input.Priority, event.Id)
 		if err != nil {
@@ -348,7 +344,7 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 
 func (nm *SNotificationManager) needWebconsole(topics []STopic) bool {
 	for i := range topics {
-		if topics[i].WebconsoleDisable.IsFalse() {
+		if topics[i].WebconsoleDisable.IsFalse() || topics[i].WebconsoleDisable.IsNone() {
 			return true
 		}
 	}
@@ -468,14 +464,45 @@ func (nm *SNotificationManager) FetchCustomizeColumns(
 	resRows := nm.SStatusStandaloneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 
 	var err error
+	notifications := make([]*SNotification, len(objs))
+	for i := range notifications {
+		notifications[i] = objs[i].(*SNotification)
+	}
+	// fetch topic_type
+	eventTopictypes := make(map[string]string)
+	for i := range notifications {
+		eventTopictypes[notifications[i].EventId] = ""
+	}
+	eventIds := make([]string, 0, len(eventTopictypes))
+	for eventId := range eventTopictypes {
+		eventIds = append(eventIds, eventId)
+	}
+	eventSubq := EventManager.Query("topic_id", "id").In("id", eventIds).SubQuery()
+	topicQ := TopicManager.Query("type")
+	topicQ = topicQ.Join(eventSubq, sqlchemy.Equals(topicQ.Field("id"), eventSubq.Field("topic_id")))
+	topicQ.AppendField(eventSubq.Field("id", "event_id"))
+	type eventTopictype struct {
+		EventId string
+		Type    string
+	}
+	ets := make([]eventTopictype, 0)
+	err = topicQ.All(&ets)
+	if err != nil {
+		log.Errorf("unable to fetch topic with eventId %s", eventIds)
+		return rows
+	}
+	for i := range ets {
+		eventTopictypes[ets[i].EventId] = ets[i].Type
+	}
+
 	for i := range rows {
-		rows[i], err = objs[i].(*SNotification).getMoreDetails(ctx, userCred, query, rows[i])
+		rows[i], err = notifications[i].getMoreDetails(ctx, userCred, query, rows[i])
 		if err != nil {
 			log.Errorf("Notification.getMoreDetails: %v", err)
 		}
+		rows[i].TopicType = eventTopictypes[notifications[i].EventId]
 		rows[i].StatusStandaloneResourceDetails = resRows[i]
 	}
-
 	return rows
 }
 
@@ -776,6 +803,11 @@ func (nm *SNotificationManager) ListItemFilter(ctx context.Context, q *sqlchemy.
 	}
 	if len(input.Tag) > 0 {
 		q = q.Equals("tag", input.Tag)
+	}
+	if len(input.TopicType) > 0 {
+		topicq := TopicManager.Query("id").Equals("type", input.TopicType).SubQuery()
+		eventq := EventManager.Query("id").In("topic_id", topicq).SubQuery()
+		q = q.In("event_id", eventq)
 	}
 	return q, nil
 }

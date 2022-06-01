@@ -15,8 +15,12 @@
 package apsara
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -68,19 +72,21 @@ const (
 )
 
 type ApsaraClientConfig struct {
-	cpcfg        cloudprovider.ProviderConfig
-	accessKey    string
-	accessSecret string
-	debug        bool
-
-	endpoints cloudprovider.SApsaraEndpoints
+	cpcfg          cloudprovider.ProviderConfig
+	accessKey      string
+	accessSecret   string
+	organizationId string
+	debug          bool
 }
 
-func NewApsaraClientConfig(accessKey, accessSecret string, endpoint string, endpoints cloudprovider.SApsaraEndpoints) *ApsaraClientConfig {
+func NewApsaraClientConfig(accessKey, accessSecret string, endpoint string) *ApsaraClientConfig {
 	cfg := &ApsaraClientConfig{
-		accessKey:    accessKey,
-		accessSecret: accessSecret,
-		endpoints:    endpoints,
+		accessKey:      accessKey,
+		accessSecret:   accessSecret,
+		organizationId: "1",
+	}
+	if info := strings.Split(accessKey, "/"); len(info) == 2 {
+		cfg.accessKey, cfg.organizationId = info[0], info[1]
 	}
 	return cfg
 }
@@ -106,7 +112,6 @@ type SApsaraClient struct {
 	ownerName string
 
 	iregions []cloudprovider.ICloudRegion
-	iBuckets []cloudprovider.ICloudBucket
 }
 
 func NewApsaraClient(cfg *ApsaraClientConfig) (*SApsaraClient, error) {
@@ -118,49 +123,10 @@ func NewApsaraClient(cfg *ApsaraClientConfig) (*SApsaraClient, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "fetchRegions")
 	}
-	if len(client.endpoints.OssEndpoint) > 0 {
-		err = client.fetchBuckets()
-		if err != nil {
-			return nil, errors.Wrapf(err, "fetchBuckets")
-		}
-		if client.debug {
-			log.Debugf("ClientID: %s ClientName: %s", client.ownerId, client.ownerName)
-		}
-	}
 	return &client, nil
 }
 
 func (self *SApsaraClient) getDomain(product string) string {
-	switch product {
-	case APSARA_PRODUCT_ECS:
-		if len(self.endpoints.EcsEndpoint) > 0 {
-			return self.endpoints.EcsEndpoint
-		}
-	case APSARA_PRODUCT_RAM:
-		if len(self.endpoints.RamEndpoint) > 0 {
-			return self.endpoints.RamEndpoint
-		}
-	case APSARA_PRODUCT_RDS:
-		if len(self.endpoints.RdsEndpoint) > 0 {
-			return self.endpoints.RdsEndpoint
-		}
-	case APSARA_PRODUCT_SLB:
-		if len(self.endpoints.SlbEndpoint) > 0 {
-			return self.endpoints.SlbEndpoint
-		}
-	case APSARA_PRODUCT_STS:
-		if len(self.endpoints.StsEndpoint) > 0 {
-			return self.endpoints.StsEndpoint
-		}
-	case APSARA_PRODUCT_VPC:
-		if len(self.endpoints.VpcEndpoint) > 0 {
-			return self.endpoints.VpcEndpoint
-		}
-	case APSARA_PRODUCT_KVSTORE:
-		if len(self.endpoints.KvsEndpoint) > 0 {
-			return self.endpoints.KvsEndpoint
-		}
-	}
 	return self.cpcfg.URL
 }
 
@@ -229,6 +195,8 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 	req.Domain = domain
 	req.Version = version
 	req.ApiName = apiName
+	req.Scheme = "http"
+	req.Method = "POST"
 	id := ""
 	if params != nil {
 		for k, v := range params {
@@ -238,7 +206,6 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 			}
 		}
 	}
-	req.Scheme = "http"
 	req.GetHeaders()["User-Agent"] = "vendor/yunion-OneCloud@" + v.Get().GitVersion
 	if strings.HasPrefix(apiName, "Describe") && len(id) > 0 {
 		req.GetHeaders()["x-acs-instanceId"] = id
@@ -277,6 +244,47 @@ func (self *SApsaraClient) getDefaultClient(regionId string) (*sdk.Client, error
 		regionId,
 		&sdk.Config{
 			HttpTransport: transport,
+			Transport: cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+				params, err := url.ParseQuery(req.URL.RawQuery)
+				if err != nil {
+					return nil, errors.Wrapf(err, "ParseQuery(%s)", req.URL.RawQuery)
+				}
+				action := params.Get("Action")
+				service := strings.ToLower(params.Get("Product"))
+				respCheck := func(resp *http.Response) {
+					if self.cpcfg.UpdatePermission != nil {
+						body, err := ioutil.ReadAll(resp.Body)
+						if err != nil {
+							return
+						}
+						resp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+						obj, err := jsonutils.Parse(body)
+						if err != nil {
+							return
+						}
+						ret := struct {
+							AsapiErrorCode string `json:"asapiErrorCode"`
+							Code           string
+						}{}
+						obj.Unmarshal(&ret)
+						if ret.Code == "403" ||
+							strings.Contains(ret.AsapiErrorCode, "NoPermission") ||
+							utils.HasPrefix(ret.Code, "Forbidden") ||
+							utils.HasPrefix(ret.Code, "NoPermission") {
+							self.cpcfg.UpdatePermission(service, action)
+						}
+					}
+				}
+				if self.cpcfg.ReadOnly {
+					for _, prefix := range []string{"Get", "List", "Describe"} {
+						if strings.HasPrefix(action, prefix) {
+							return respCheck, nil
+						}
+					}
+					return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+				}
+				return respCheck, nil
+			}),
 		},
 		&credentials.BaseCredential{
 			AccessKeyId:     self.accessKey,
@@ -301,6 +309,29 @@ func (self *SApsaraClient) ecsRequest(apiName string, params map[string]string) 
 	}
 	domain := self.getDomain(APSARA_PRODUCT_ECS)
 	return productRequest(cli, APSARA_PRODUCT_ECS, domain, APSARA_API_VERSION, apiName, params, self.debug)
+}
+
+func (self *SApsaraClient) ossRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cli, err := self.getDefaultClient("")
+	if err != nil {
+		return nil, err
+	}
+	//pm := map[string]string{}
+	//for k, v := range params {
+	//	if k != "RegionId" {
+	//		pm[k] = v
+	//		delete(params, k)
+	//	}
+	//}
+	//if len(pm) > 0 {
+	//	params["Params"] = jsonutils.Marshal(pm).String()
+	//}
+	if _, ok := params["RegionId"]; !ok {
+		params["RegionId"] = self.cpcfg.DefaultRegion
+	}
+	params["ProductName"] = "oss"
+	params["OpenApiAction"] = apiName
+	return productRequest(cli, "OneRouter", self.cpcfg.URL, "2018-12-12", "DoOpenApi", params, self.debug)
 }
 
 func (self *SApsaraClient) trialRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
@@ -336,7 +367,7 @@ func (self *SApsaraClient) fetchRegions() error {
 }
 
 // https://help.apsara.com/document_detail/31837.html?spm=a2c4g.11186623.2.6.XqEgD1
-func (client *SApsaraClient) getOssClient(regionId string) (*oss.Client, error) {
+func (client *SApsaraClient) getOssClient(endpoint string) (*oss.Client, error) {
 	// NOTE
 	//
 	// oss package as of version 20181116160301-c6838fdc33ed does not
@@ -347,77 +378,24 @@ func (client *SApsaraClient) getOssClient(regionId string) (*oss.Client, error) 
 	// https_proxy setting
 	// oss use no timeout client so as to send/download large files
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
+	transport, _ := httpClient.Transport.(*http.Transport)
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		if client.cpcfg.ReadOnly {
+			if req.Method == "GET" || req.Method == "HEAD" {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
 	cliOpts := []oss.ClientOption{
 		oss.HTTPClient(httpClient),
 	}
-	cli, err := oss.New(client.endpoints.OssEndpoint, client.accessKey, client.accessSecret, cliOpts...)
+	cli, err := oss.New(endpoint, client.accessKey, client.accessSecret, cliOpts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "oss.New")
 	}
 	return cli, nil
-}
-
-func (self *SApsaraClient) getRegionByRegionId(id string) (cloudprovider.ICloudRegion, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		if self.iregions[i].GetId() == id {
-			return self.iregions[i], nil
-		}
-	}
-	return nil, cloudprovider.ErrNotFound
-}
-
-func (self *SApsaraClient) invalidateIBuckets() {
-	self.iBuckets = nil
-}
-
-func (self *SApsaraClient) getIBuckets() ([]cloudprovider.ICloudBucket, error) {
-	if len(self.endpoints.OssEndpoint) == 0 {
-		return nil, fmt.Errorf("empty oss endpoint")
-	}
-	if self.iBuckets == nil {
-		err := self.fetchBuckets()
-		if err != nil {
-			return nil, errors.Wrap(err, "fetchBuckets")
-		}
-	}
-	return self.iBuckets, nil
-}
-
-func (self *SApsaraClient) fetchBuckets() error {
-	osscli, err := self.getOssClient("")
-	if err != nil {
-		return errors.Wrap(err, "self.getOssClient")
-	}
-	result, err := osscli.ListBuckets()
-	if err != nil {
-		return errors.Wrap(err, "oss.ListBuckets")
-	}
-
-	self.ownerId = result.Owner.ID
-	self.ownerName = result.Owner.DisplayName
-
-	ret := make([]cloudprovider.ICloudBucket, 0)
-	for _, bInfo := range result.Buckets {
-		regionId := bInfo.Location
-		if strings.HasPrefix(regionId, "oss-") {
-			regionId = regionId[4:]
-		}
-		region, err := self.getRegionByRegionId(regionId)
-		if err != nil {
-			log.Errorf("cannot find bucket %s region %s", bInfo.Name, regionId)
-			continue
-		}
-		b := SBucket{
-			region:       region.(*SRegion),
-			Name:         bInfo.Name,
-			Location:     bInfo.Location,
-			CreationDate: bInfo.CreationDate,
-			StorageClass: bInfo.StorageClass,
-		}
-		ret = append(ret, &b)
-	}
-	self.iBuckets = ret
-	return nil
 }
 
 func (self *SApsaraClient) GetRegions() []SRegion {
@@ -441,6 +419,9 @@ func (self *SApsaraClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 	subAccount := cloudprovider.SSubAccount{}
 	subAccount.Name = self.cpcfg.Name
 	subAccount.Account = self.accessKey
+	if self.organizationId != "1" {
+		subAccount.Account = fmt.Sprintf("%s/%s", self.accessKey, self.organizationId)
+	}
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
 	return []cloudprovider.SSubAccount{subAccount}, nil
 }
@@ -517,6 +498,7 @@ func (region *SApsaraClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_RDS,
 		cloudprovider.CLOUD_CAPABILITY_CACHE,
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_IPV6_GATEWAY + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

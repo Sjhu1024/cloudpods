@@ -41,8 +41,10 @@ import (
 	compute_modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/util/httputils"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -69,6 +71,7 @@ func (h *AuthHandlers) AddMethods() {
 		NewHP(h.getIdpSsoRedirectUri, "sso", "redirect", "<idp_id>"),
 		NewHP(h.listTotpRecoveryQuestions, "recovery"),
 		NewHP(h.handleSsoLogin, "ssologin"),
+		NewHP(h.handleIdpInitSsoLogin, "ssologin", "<idp_id>"),
 		NewHP(h.postLogoutHandler, "logout"),
 		// oidc auth
 		NewHP(handleOIDCAuth, "oidc", "auth"),
@@ -84,6 +87,7 @@ func (h *AuthHandlers) AddMethods() {
 		NewHP(h.postLoginHandler, "login"),
 		NewHP(h.postLogoutHandler, "logout"),
 		NewHP(h.handleSsoLogin, "ssologin"),
+		NewHP(h.handleIdpInitSsoLogin, "ssologin", "<idp_id>"),
 		NewHP(handleOIDCToken, "oidc", "token"),
 	)
 
@@ -142,6 +146,7 @@ func (h *AuthHandlers) GetRegionsResponse(ctx context.Context, w http.ResponseWr
 		SCommonConfig: agapi.SCommonConfig{
 			ApiServer: options.Options.ApiServer,
 		},
+		EncryptPasswd: true,
 	}
 
 	s := auth.GetAdminSession(ctx, regions[0], "")
@@ -334,10 +339,8 @@ func (h *AuthHandlers) doCredentialLogin(ctx context.Context, req *http.Request,
 		if err != nil {
 			return nil, httperrors.NewInputParameterError("get password in body")
 		}
-		// try base64 decryption
-		if decPasswd, err := base64.StdEncoding.DecodeString(passwd); err == nil && stringutils2.IsPrintableAsciiString(string(decPasswd)) {
-			passwd = string(decPasswd)
-		}
+		passwd = decodePassword(passwd)
+
 		if len(uname) == 0 || len(passwd) == 0 {
 			return nil, httperrors.NewInputParameterError("username or password is empty")
 		}
@@ -347,7 +350,9 @@ func (h *AuthHandlers) doCredentialLogin(ctx context.Context, req *http.Request,
 		domain, _ := body.GetString("domain")
 		token, err = auth.Client().AuthenticateWeb(uname, passwd, domain, "", "", cliIp)
 	} else if body.Contains("idp_driver") { // sso login
-		token, err = processSsoLoginData(body, cliIp)
+		idpId, _ := body.GetString("idp_id")
+		redirectUri := getSsoCallbackUrl(ctx, req, idpId)
+		token, err = processSsoLoginData(body, cliIp, redirectUri)
 		if err != nil {
 			return nil, errors.Wrap(err, "processSsoLoginData")
 		}
@@ -618,6 +623,12 @@ func (h *AuthHandlers) doLogin(ctx context.Context, w http.ResponseWriter, req *
 }
 
 func (h *AuthHandlers) postLogoutHandler(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	token, _, _ := fetchAuthInfo(ctx, req)
+	if token != nil {
+		// valid login, log the event
+		user := logclient.NewSimpleObject(token.GetUserId(), token.GetUserName(), "user")
+		logclient.AddActionLogWithContext(ctx, user, logclient.ACT_LOGOUT, "", token, true)
+	}
 	clearAuthCookie(w)
 	appsrv.DisableClientCache(w)
 	appsrv.Send(w, "")
@@ -850,7 +861,7 @@ func getUserInfo2(s *mcclient.ClientSession, uid string, pid string, loginIp str
 		"created_at", "enable_mfa", "is_system_account",
 		"last_active_at", "last_login_ip",
 		"last_login_source",
-		"password_expires_at", "failed_auth_count", "failed_auth_at",
+		"password_expires_at", "failed_auth_count", "failed_auth_at", "need_reset_password",
 		"idps",
 		"is_local",
 	} {
@@ -867,6 +878,7 @@ func getUserInfo2(s *mcclient.ClientSession, uid string, pid string, loginIp str
 	data.Add(jsonutils.NewString(usrDomainId), "domain", "id")
 	data.Add(jsonutils.NewString(usrDomainName), "domain", "name")
 	data.Add(jsonutils.NewStringArray(auth.AdminCredential().GetRegions()), "regions")
+	data.Add(jsonutils.NewBool(options.Options.EnableTotp), "system_totp_on")
 
 	var projName string
 	var projDomainId string
@@ -1052,7 +1064,7 @@ func getUserInfo2(s *mcclient.ClientSession, uid string, pid string, loginIp str
 		data.Add(jsonutils.JSONFalse, "enable_quota_check")
 	}
 
-	data.Add(jsonutils.NewString(getSsoCallbackUrl()), "sso_callback_url")
+	// data.Add(jsonutils.NewString(getSsoCallbackUrl(ctx, req, idpId)), "sso_callback_url")
 
 	return data, nil
 }
@@ -1190,12 +1202,19 @@ func (h *AuthHandlers) resetUserPassword(ctx context.Context, w http.ResponseWri
 		return
 	}
 
-	oldPwd, _ := body.GetString("password_old")
-	newPwd, _ := body.GetString("password_new")
-	confirmPwd, _ := body.GetString("password_confirm")
-	passcode, _ := body.GetString("passcode")
+	input := struct {
+		PasswordOld     string
+		PasswordNew     string
+		PasswordConfirm string
+		Passcode        string
+	}{}
+	body.Unmarshal(&input)
 
-	if newPwd != confirmPwd {
+	input.PasswordOld = decodePassword(input.PasswordOld)
+	input.PasswordNew = decodePassword(input.PasswordNew)
+	input.PasswordConfirm = decodePassword(input.PasswordConfirm)
+
+	if input.PasswordNew != input.PasswordConfirm {
 		httperrors.InputParameterError(ctx, w, "new password mismatch")
 		return
 	}
@@ -1207,7 +1226,7 @@ func (h *AuthHandlers) resetUserPassword(ctx context.Context, w http.ResponseWri
 	}
 
 	cliIp := netutils2.GetHttpRequestIp(req)
-	_, err = auth.Client().AuthenticateWeb(t.GetUserName(), oldPwd, t.GetDomainName(), "", "", cliIp)
+	_, err = auth.Client().AuthenticateWeb(t.GetUserName(), input.PasswordOld, t.GetDomainName(), "", "", cliIp)
 	if err != nil {
 		switch httperr := err.(type) {
 		case *httputils.JSONClientError:
@@ -1223,7 +1242,7 @@ func (h *AuthHandlers) resetUserPassword(ctx context.Context, w http.ResponseWri
 	s := auth.GetAdminSession(ctx, FetchRegion(req), "")
 	// 2.如果已开启MFA，验证 随机密码正确
 	if isMfaEnabled(user) {
-		err = authToken.VerifyTotpPasscode(s, t.GetUserId(), passcode)
+		err = authToken.VerifyTotpPasscode(s, t.GetUserId(), input.Passcode)
 		if err != nil {
 			httperrors.InputParameterError(ctx, w, "invalid passcode")
 			return
@@ -1232,7 +1251,7 @@ func (h *AuthHandlers) resetUserPassword(ctx context.Context, w http.ResponseWri
 
 	// 3.重置密码，
 	params := jsonutils.NewDict()
-	params.Set("password", jsonutils.NewString(newPwd))
+	params.Set("password", jsonutils.NewString(input.PasswordNew))
 	_, err = modules.UsersV3.Patch(s, t.GetUserId(), params)
 	if err != nil {
 		httperrors.GeneralServerError(ctx, w, err)
@@ -1262,4 +1281,15 @@ func isMfaEnabled(user jsonutils.JSONObject) bool {
 	}
 
 	return false
+}
+
+func decodePassword(passwd string) string {
+	if decPasswd, err := seclib2.AES_256.CbcDecodeBase64(passwd, []byte(agapi.DefaultEncryptKey)); err == nil && stringutils2.IsPrintableAsciiString(string(decPasswd)) {
+		// First try AES decryption
+		passwd = string(decPasswd)
+	} else if decPasswd, err := base64.StdEncoding.DecodeString(passwd); err == nil && stringutils2.IsPrintableAsciiString(string(decPasswd)) {
+		// try base64 decryption
+		passwd = string(decPasswd)
+	}
+	return passwd
 }

@@ -89,9 +89,9 @@ type SIdentityProvider struct {
 	TargetDomainId string `width:"64" charset:"ascii" nullable:"true" list:"domain" create:"admin_optional"`
 
 	// 是否自动创建项目
-	AutoCreateProject tristate.TriState `default:"true" nullable:"true" list:"domain" create:"domain_optional" update:"domain"`
+	AutoCreateProject tristate.TriState `default:"true" list:"domain" create:"domain_optional" update:"domain"`
 	// 是否自动创建用户
-	AutoCreateUser tristate.TriState `nullable:"true" list:"domain" create:"domain_optional" update:"domain"`
+	AutoCreateUser tristate.TriState `list:"domain" create:"domain_optional" update:"domain"`
 
 	ErrorCount int `list:"domain"`
 
@@ -104,9 +104,9 @@ type SIdentityProvider struct {
 	// 认证源图标
 	IconUri string `width:"256" charset:"utf8" nullable:"true" list:"user" create:"domain_optional" update:"domain"`
 	// 是否是SSO登录方式
-	IsSso tristate.TriState `nullable:"true" list:"domain"`
+	IsSso tristate.TriState `list:"domain"`
 	// 是否是缺省SSO登录方式
-	IsDefault tristate.TriState `nullable:"true" list:"domain"`
+	IsDefault tristate.TriState `list:"domain"`
 }
 
 func (manager *SIdentityProviderManager) initializeAutoCreateUser() error {
@@ -1003,42 +1003,49 @@ func (self *SIdentityProvider) SyncOrCreateDomain(ctx context.Context, extId str
 				}
 			}
 		}
-		return domain, nil
-	}
+	} else {
+		// otherwise, create the domain
+		domain = &SDomain{}
+		domain.SetModelManager(DomainManager, domain)
+		domain.Id = domainId
+		domain.Enabled = tristate.True
+		domain.IsDomain = tristate.True
+		domain.DomainId = api.KeystoneDomainRoot
+		domain.Description = fmt.Sprintf("domain for %s", extDesc)
 
-	// otherwise, create the domain
-	domain = &SDomain{}
-	domain.SetModelManager(DomainManager, domain)
-	domain.Id = domainId
-	domain.Enabled = tristate.True
-	domain.IsDomain = tristate.True
-	domain.DomainId = api.KeystoneDomainRoot
-	domain.Description = fmt.Sprintf("domain for %s", extDesc)
+		err = func() error {
+			lockman.LockClass(ctx, DomainManager, "name")
+			defer lockman.ReleaseClass(ctx, DomainManager, "name")
 
-	err = func() error {
-		lockman.LockClass(ctx, DomainManager, "name")
-		defer lockman.ReleaseClass(ctx, DomainManager, "name")
+			newName, err := db.GenerateName(ctx, DomainManager, nil, extName)
+			if err != nil {
+				return errors.Wrap(err, "GenerateName")
+			}
+			domain.Name = newName
 
-		newName, err := db.GenerateName(ctx, DomainManager, nil, extName)
+			return DomainManager.TableSpec().Insert(ctx, domain)
+		}()
 		if err != nil {
-			return errors.Wrap(err, "GenerateName")
+			return nil, errors.Wrap(err, "insert")
 		}
-		domain.Name = newName
-
-		return DomainManager.TableSpec().Insert(ctx, domain)
-	}()
-	if err != nil {
-		return nil, errors.Wrap(err, "insert")
 	}
 
 	if self.AutoCreateProject.IsTrue() && consts.GetNonDefaultDomainProjects() && createDefaultProject {
-		_, err := ProjectManager.NewProject(ctx,
-			fmt.Sprintf("%s_default_project", extName),
-			fmt.Sprintf("Default project for domain %s", extName),
-			domain.Id,
-		)
+		// check existence
+		projCnt, err := domain.GetProjectCount()
 		if err != nil {
-			log.Errorf("ProjectManager.NewProject fail %s", err)
+			return nil, errors.Wrap(err, "get domain project count")
+		}
+		if projCnt == 0 {
+			// not exist, to create
+			_, err := ProjectManager.NewProject(ctx,
+				fmt.Sprintf("%s_default_project", extName),
+				fmt.Sprintf("Default project for domain %s", extName),
+				domain.Id,
+			)
+			if err != nil {
+				log.Errorf("ProjectManager.NewProject fail %s", err)
+			}
 		}
 	}
 
@@ -1377,6 +1384,29 @@ func (idp *SIdentityProvider) GetDetailsSsoRedirectUri(ctx context.Context, user
 	}
 
 	output.Uri = uri
+	output.Driver = idp.Driver
+
+	return output, nil
+}
+
+func (idp *SIdentityProvider) GetDetailsSsoCallbackUri(ctx context.Context, userCred mcclient.TokenCredential, query api.GetIdpSsoCallbackUriInput) (api.GetIdpSsoCallbackUriOutput, error) {
+	output := api.GetIdpSsoCallbackUriOutput{}
+	conf, err := GetConfigs(idp, true, nil, nil)
+	if err != nil {
+		return output, errors.Wrap(err, "idp.GetConfig")
+	}
+
+	backend, err := driver.GetDriver(idp.Driver, idp.Id, idp.Name, idp.Template, idp.TargetDomainId, conf)
+	if err != nil {
+		return output, errors.Wrap(err, "driver.GetDriver")
+	}
+
+	uri := backend.GetSsoCallbackUri(query.RedirectUri)
+	if err != nil {
+		return output, errors.Wrap(err, "backend.GetSsoCallbackUri")
+	}
+
+	output.RedirectUri = uri
 	output.Driver = idp.Driver
 
 	return output, nil

@@ -37,7 +37,7 @@ func init() {
 func (self *InstanceBackupDeleteTask) taskFailed(ctx context.Context, ib *models.SInstanceBackup, reason jsonutils.JSONObject) {
 	reasonStr, _ := reason.GetString()
 	ib.SetStatus(self.UserCred, compute.INSTANCE_BACKUP_STATUS_DELETE_FAILED, reasonStr)
-	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_CREATE, reason, self.UserCred, false)
+	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_DELETE, reason, self.UserCred, false)
 	self.SetStageFailed(ctx, reason)
 }
 
@@ -61,13 +61,13 @@ func (self *InstanceBackupDeleteTask) OnKvmDiskBackupDelete(
 	backupId, _ := self.Params.GetString("del_backup_id")
 	// detach backup and instance
 	isjp := new(models.SInstanceBackupJoint)
+	isjp.SetModelManager(models.InstanceBackupJointManager, isjp)
 	err := models.InstanceBackupJointManager.Query().
 		Equals("instance_backup_id", isp.Id).Equals("disk_backup_id", backupId).First(isjp)
 	if err != nil {
 		self.taskFailed(ctx, isp, jsonutils.NewString(err.Error()))
 		return
 	}
-	isjp.SetModelManager(models.InstanceBackupJointManager, isjp)
 	err = isjp.Delete(ctx, self.UserCred)
 	if err != nil {
 		self.taskFailed(ctx, isp, jsonutils.NewString(err.Error()))
@@ -79,14 +79,13 @@ func (self *InstanceBackupDeleteTask) OnKvmDiskBackupDelete(
 	}
 }
 
-func (self *InstanceBackupDeleteTask) OnKvmBackupDeleteFailed(
+func (self *InstanceBackupDeleteTask) OnKvmDiskBackupDeleteFailed(
 	ctx context.Context, ib *models.SInstanceBackup, data jsonutils.JSONObject) {
 	self.taskFailed(ctx, ib, data)
 }
 
 func (self *InstanceBackupDeleteTask) OnInstanceBackupDelete(ctx context.Context, ib *models.SInstanceBackup, data jsonutils.JSONObject) {
 	self.taskSuccess(ctx, ib, data)
-
 }
 
 func (self *InstanceBackupDeleteTask) OnInstanceBackupDeleteFailed(ctx context.Context, ib *models.SInstanceBackup, data jsonutils.JSONObject) {

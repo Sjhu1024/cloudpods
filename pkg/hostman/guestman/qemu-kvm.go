@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,8 +33,13 @@ import (
 	"yunion.io/x/pkg/util/seclib"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	hostapi "yunion.io/x/onecloud/pkg/apis/host"
+	noapi "yunion.io/x/onecloud/pkg/apis/notify"
 	"yunion.io/x/onecloud/pkg/appctx"
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
+	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo"
@@ -42,12 +48,18 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/monitor"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	identity_modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/util/cgrouputils"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
+	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/regutils2"
+	"yunion.io/x/onecloud/pkg/util/seclib2"
 	"yunion.io/x/onecloud/pkg/util/timeutils2"
 	"yunion.io/x/onecloud/pkg/util/version"
 )
@@ -87,6 +99,13 @@ func (s *SKVMGuestInstance) IsStopping() bool {
 	return s.stopping
 }
 
+func (s *SKVMGuestInstance) IsValid() bool {
+	if s.Desc != nil && s.Desc.Contains("uuid") {
+		return true
+	}
+	return false
+}
+
 func (s *SKVMGuestInstance) GetId() string {
 	id, _ := s.Desc.GetString("uuid")
 	return id
@@ -100,6 +119,14 @@ func (s *SKVMGuestInstance) GetName() string {
 
 func (s *SKVMGuestInstance) getStateFilePathRootPrefix() string {
 	return path.Join(s.HomeDir(), STATE_FILE_PREFIX)
+}
+
+func (s *SKVMGuestInstance) GetStateFilePath(version string) string {
+	p := s.getStateFilePathRootPrefix()
+	if version != "" {
+		p = fmt.Sprintf("%s_%s", p, version)
+	}
+	return p
 }
 
 func (s *SKVMGuestInstance) getQemuLogPath() string {
@@ -130,12 +157,54 @@ func (s *SKVMGuestInstance) GetVncFilePath() string {
 	return path.Join(s.HomeDir(), "vnc")
 }
 
+func (s *SKVMGuestInstance) getEncryptKeyPath() string {
+	return path.Join(s.HomeDir(), "key")
+}
+
+func (s *SKVMGuestInstance) getEncryptKeyId() string {
+	encKeyId, _ := s.Desc.GetString("encrypt_key_id")
+	return encKeyId
+}
+
+func (s *SKVMGuestInstance) isEncrypted() bool {
+	return len(s.getEncryptKeyId()) > 0
+}
+
+func (s *SKVMGuestInstance) getEncryptKey(ctx context.Context, userCred mcclient.TokenCredential) (apis.SEncryptInfo, error) {
+	ret := apis.SEncryptInfo{}
+	encKeyId, _ := s.Desc.GetString("encrypt_key_id")
+	if len(encKeyId) > 0 {
+		if userCred == nil {
+			return ret, errors.Wrap(httperrors.ErrUnauthorized, "no credential to fetch encrypt key")
+		}
+		session := auth.GetSession(ctx, userCred, consts.GetRegion(), "")
+		secKey, err := identity_modules.Credentials.GetEncryptKey(session, encKeyId)
+		if err != nil {
+			return ret, errors.Wrap(err, "GetEncryptKey")
+		}
+		ret.Id = secKey.KeyId
+		ret.Name = secKey.KeyName
+		ret.Key = secKey.Key
+		ret.Alg = secKey.Alg
+		return ret, nil
+	}
+	return ret, nil
+}
+
+func (s *SKVMGuestInstance) saveEncryptKeyFile(key string) error {
+	return fileutils2.FilePutContents(s.getEncryptKeyPath(), key, false)
+}
+
 func (s *SKVMGuestInstance) getOriginId() string {
 	originId, _ := s.Desc.GetString("metadata", "__origin_id")
 	if len(originId) == 0 {
 		originId = s.Id
 	}
 	return originId
+}
+
+func (s *SKVMGuestInstance) isImportFromLibvirt() bool {
+	return s.Desc.Contains("metadata", "__origin_id")
 }
 
 func (s *SKVMGuestInstance) GetPid() int {
@@ -228,6 +297,10 @@ func (s *SKVMGuestInstance) LoadDesc() error {
 
 func (s *SKVMGuestInstance) IsDirtyShotdown() bool {
 	return s.GetPid() == -2
+}
+
+func (s *SKVMGuestInstance) IsDaemon() bool {
+	return jsonutils.QueryBoolean(s.Desc, "is_daemon", false)
 }
 
 func (s *SKVMGuestInstance) DirtyServerRequestStart() {
@@ -350,13 +423,13 @@ func (s *SKVMGuestInstance) ImportServer(pendingDelete bool) {
 	s.manager.SaveServer(s.Id, s)
 	s.manager.RemoveCandidateServer(s)
 
-	if s.IsDirtyShotdown() && !pendingDelete {
-		log.Infof("Server dirty shotdown %s", s.GetName())
+	if (s.IsDirtyShotdown() || s.IsDaemon()) && !pendingDelete {
+		log.Infof("Server dirty shotdown or a daemon %s", s.GetName())
 		if jsonutils.QueryBoolean(s.Desc, "is_master", false) ||
 			jsonutils.QueryBoolean(s.Desc, "is_slave", false) {
 			go s.DirtyServerRequestStart()
 		} else {
-			s.StartGuest(context.Background(), jsonutils.NewDict())
+			s.StartGuest(context.Background(), nil, jsonutils.NewDict())
 		}
 		return
 	}
@@ -799,7 +872,7 @@ func (s *SKVMGuestInstance) onMonitorTimeout(ctx context.Context, err error) {
 	log.Errorf("Monitor connect timeout, VM %s frozen: %s force restart!!!!", s.Id, err)
 	s.ForceStop()
 	timeutils2.AddTimeout(
-		time.Second*3, func() { s.StartGuest(ctx, jsonutils.NewDict()) })
+		time.Second*3, func() { s.StartGuest(ctx, nil, jsonutils.NewDict()) })
 }
 
 func (s *SKVMGuestInstance) GetHmpMonitorPort(vncPort int) int {
@@ -934,16 +1007,47 @@ func (t *guestStartTask) Dump() string {
 	return fmt.Sprintf("guest %s params: %v", t.s.Id, t.params)
 }
 
-func (s *SKVMGuestInstance) StartGuest(ctx context.Context, params *jsonutils.JSONDict) {
+func (s *SKVMGuestInstance) prepareEncryptKeyForStart(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
+	if s.isEncrypted() {
+		ekey, err := s.getEncryptKey(ctx, userCred)
+		if err != nil {
+			log.Errorf("fail to fetch encrypt key: %s", err)
+			return nil, errors.Wrap(err, "getEncryptKey")
+		}
+		if params == nil {
+			params = jsonutils.NewDict()
+		}
+		params.Add(jsonutils.NewString(ekey.Key), "encrypt_key")
+	}
+	return params, nil
+}
+
+func (s *SKVMGuestInstance) StartGuest(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict) error {
+	var err error
+	params, err = s.prepareEncryptKeyForStart(ctx, userCred, params)
+	if err != nil {
+		return errors.Wrap(err, "prepareEncryptKeyForStart")
+	}
 	task := &guestStartTask{
 		s:      s,
 		ctx:    ctx,
 		params: params,
 	}
 	s.manager.GuestStartWorker.Run(task, nil, nil)
+	return nil
 }
 
-func (s *SKVMGuestInstance) DeployFs(deployInfo *deployapi.DeployInfo) (jsonutils.JSONObject, error) {
+func (s *SKVMGuestInstance) DeployFs(ctx context.Context, userCred mcclient.TokenCredential, deployInfo *deployapi.DeployInfo) (jsonutils.JSONObject, error) {
+	diskInfo := deployapi.DiskInfo{}
+	if s.isEncrypted() {
+		ekey, err := s.getEncryptKey(ctx, userCred)
+		if err != nil {
+			log.Errorf("fail to fetch encrypt key: %s", err)
+			return nil, errors.Wrap(err, "getEncryptKey")
+		}
+		diskInfo.EncryptPassword = ekey.Key
+		diskInfo.EncryptAlg = string(ekey.Alg)
+	}
 	disks, _ := s.Desc.GetArray("disks")
 	if len(disks) > 0 {
 		diskPath, _ := disks[0].GetString("path")
@@ -951,7 +1055,8 @@ func (s *SKVMGuestInstance) DeployFs(deployInfo *deployapi.DeployInfo) (jsonutil
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
 		}
-		return disk.DeployGuestFs(disk.GetPath(), s.Desc, deployInfo)
+		diskInfo.Path = diskPath
+		return disk.DeployGuestFs(&diskInfo, s.Desc, deployInfo)
 	} else {
 		return nil, fmt.Errorf("Guest dosen't have disk ??")
 	}
@@ -1018,7 +1123,7 @@ func (s *SKVMGuestInstance) CleanupCpuset() {
 }
 
 func (s *SKVMGuestInstance) GetCleanFiles() []string {
-	return []string{s.GetPidFilePath(), s.GetVncFilePath()}
+	return []string{s.GetPidFilePath(), s.GetVncFilePath(), s.getEncryptKeyPath()}
 }
 
 func (s *SKVMGuestInstance) delTmpDisks(ctx context.Context, migrated bool) error {
@@ -1028,13 +1133,21 @@ func (s *SKVMGuestInstance) delTmpDisks(ctx context.Context, migrated bool) erro
 			diskPath, _ := disk.GetString("path")
 			d, _ := storageman.GetManager().GetDiskByPath(diskPath)
 			if d != nil && d.GetType() == api.STORAGE_LOCAL && migrated {
-				if err := d.DeleteAllSnapshot(); err != nil {
+				skipRecycle := true
+				if err := d.DeleteAllSnapshot(skipRecycle); err != nil {
 					log.Errorln(err)
 					return err
 				}
-				if _, err := d.Delete(ctx, nil); err != nil {
+				if _, err := d.Delete(ctx, api.DiskDeleteInput{SkipRecycle: &skipRecycle}); err != nil {
 					log.Errorln(err)
 					return err
+				}
+			}
+			if migrated {
+				// remove memory snapshot files
+				dir := GetMemorySnapshotPath(s.GetId(), "")
+				if err := procutils.NewRemoteCommandAsFarAsPossible("rm", "-rf", dir).Run(); err != nil {
+					return errors.Wrapf(err, "remove dir %q", dir)
 				}
 			}
 		}
@@ -1114,7 +1227,7 @@ func (s *SKVMGuestInstance) ExecStopTask(ctx context.Context, params interface{}
 }
 
 func (s *SKVMGuestInstance) ExecSuspendTask(ctx context.Context) {
-	// TODO
+	NewGuestSuspendTask(s, ctx, nil).Start()
 }
 
 func (s *SKVMGuestInstance) GetNicDescMatch(mac, ip, port, bridge string) jsonutils.JSONObject {
@@ -1342,7 +1455,7 @@ func (s *SKVMGuestInstance) SyncConfig(ctx context.Context, desc jsonutils.JSONO
 	var changedNetworks [][]jsonutils.JSONObject
 	var cdrom *string
 
-	if !fwOnly {
+	if !fwOnly && !s.isImportFromLibvirt() {
 		delDisks, addDisks = s.compareDescDisks(desc)
 		cdrom = s.compareDescCdrom(desc)
 		delNetworks, addNetworks, changedNetworks = s.compareDescNetworks(desc)
@@ -1445,6 +1558,7 @@ func (s *SKVMGuestInstance) SetCgroup() {
 	s.cgroupPid = s.GetPid()
 	s.setCgroupIo()
 	s.setCgroupCpu()
+	s.setCgroupCPUSet()
 }
 
 func (s *SKVMGuestInstance) setCgroupIo() {
@@ -1472,6 +1586,31 @@ func (s *SKVMGuestInstance) setCgroupCpu() {
 	)
 
 	cgrouputils.CgroupSet(strconv.Itoa(s.cgroupPid), int(cpu)*cpuWeight)
+}
+
+func (s *SKVMGuestInstance) setCgroupCPUSet() {
+	meta, _ := s.Desc.Get("metadata")
+	if meta == nil {
+		return
+	}
+	cpusetStr, _ := meta.GetString(api.VM_METADATA_CGROUP_CPUSET)
+	if len(cpusetStr) == 0 {
+		return
+	}
+	obj, err := jsonutils.ParseString(cpusetStr)
+	if err != nil {
+		log.Errorf("Parse cpusetStr %q error: %v", cpusetStr, err)
+		return
+	}
+	input := new(api.ServerCPUSetInput)
+	if err := obj.Unmarshal(input); err != nil {
+		log.Errorf("Unmarshal %q to ServerCPUSetInput: %v", obj, err)
+		return
+	}
+	if _, err := s.CPUSet(context.Background(), input); err != nil {
+		log.Errorf("Do CPUSet error: %v", err)
+		return
+	}
 }
 
 func (s *SKVMGuestInstance) CreateFromDesc(desc jsonutils.JSONObject) error {
@@ -1552,7 +1691,7 @@ func (s *SKVMGuestInstance) SyncMetadata(meta *jsonutils.JSONDict) error {
 	_, err := modules.Servers.SetMetadata(hostutils.GetComputeSession(context.Background()),
 		s.Id, meta)
 	if err != nil {
-		log.Errorln("sync metadata error: %v", err)
+		log.Errorf("sync metadata error: %v", err)
 		return errors.Wrap(err, "set metadata")
 	}
 	return nil
@@ -1640,9 +1779,9 @@ func (s *SKVMGuestInstance) ListStateFilePaths() []string {
 	return ret
 }
 
-// 好像不用了
 func (s *SKVMGuestInstance) CleanStatefiles() {
 	for _, stateFile := range s.ListStateFilePaths() {
+		log.Infof("Server %s remove statefile %q", s.GetName(), stateFile)
 		if _, err := procutils.NewCommand("mountpoint", stateFile).Output(); err == nil {
 			if output, err := procutils.NewCommand("umount", stateFile).Output(); err != nil {
 				log.Errorf("umount %s failed: %s, %s", stateFile, err, output)
@@ -1691,30 +1830,45 @@ func (s *SKVMGuestInstance) ExecReloadDiskTask(ctx context.Context, disk storage
 }
 
 func (s *SKVMGuestInstance) ExecDiskSnapshotTask(
-	ctx context.Context, disk storageman.IDisk, snapshotId string,
+	ctx context.Context, userCred mcclient.TokenCredential, disk storageman.IDisk, snapshotId string,
 ) (jsonutils.JSONObject, error) {
+	var (
+		encryptKey = ""
+		encFormat  qemuimg.TEncryptFormat
+		encAlg     seclib2.TSymEncAlg
+	)
+	if s.isEncrypted() {
+		key, err := s.getEncryptKey(ctx, userCred)
+		if err != nil {
+			return nil, errors.Wrap(err, "getEncryptKey")
+		}
+		encryptKey = key.Key
+		encFormat = qemuimg.EncryptFormatLuks
+		encAlg = key.Alg
+	}
 	if s.IsRunning() {
 		if !s.isLiveSnapshotEnabled() {
 			return nil, fmt.Errorf("Guest dosen't support live snapshot")
 		}
-		err := disk.CreateSnapshot(snapshotId)
+		err := disk.CreateSnapshot(snapshotId, encryptKey, encFormat, encAlg)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "disk.CreateSnapshot")
 		}
 		task := NewGuestDiskSnapshotTask(ctx, s, disk, snapshotId)
 		task.Start()
 		return nil, nil
 	} else {
-		return s.StaticSaveSnapshot(ctx, disk, snapshotId)
+		return s.StaticSaveSnapshot(ctx, disk, snapshotId, encryptKey, encFormat, encAlg)
 	}
 }
 
 func (s *SKVMGuestInstance) StaticSaveSnapshot(
 	ctx context.Context, disk storageman.IDisk, snapshotId string,
+	encryptKey string, encFormat qemuimg.TEncryptFormat, encAlg seclib2.TSymEncAlg,
 ) (jsonutils.JSONObject, error) {
-	err := disk.CreateSnapshot(snapshotId)
+	err := disk.CreateSnapshot(snapshotId, encryptKey, encFormat, encAlg)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "disk.CreateSnapshot")
 	}
 	location := path.Join(disk.GetSnapshotLocation(), snapshotId)
 	res := jsonutils.NewDict()
@@ -1752,6 +1906,84 @@ func (s *SKVMGuestInstance) deleteStaticSnapshotFile(
 	res := jsonutils.NewDict()
 	res.Set("deleted", jsonutils.JSONTrue)
 	return res, nil
+}
+
+func GetMemorySnapshotPath(serverId, instanceSnapshotId string) string {
+	dir := options.HostOptions.MemorySnapshotsPath
+	memSnapPath := filepath.Join(dir, serverId, instanceSnapshotId)
+	return memSnapPath
+}
+
+func (s *SKVMGuestInstance) ExecMemorySnapshotTask(ctx context.Context, input *hostapi.GuestMemorySnapshotRequest) (jsonutils.JSONObject, error) {
+	if !s.IsRunning() {
+		return nil, errors.Errorf("Server is not running status")
+	}
+	if s.IsSuspend() {
+		return nil, errors.Errorf("Server is suspend status")
+	}
+	memSnapPath := GetMemorySnapshotPath(s.GetId(), input.InstanceSnapshotId)
+	dir := filepath.Dir(memSnapPath)
+	if err := procutils.NewRemoteCommandAsFarAsPossible("mkdir", "-p", dir).Run(); err != nil {
+		return nil, errors.Wrapf(err, "mkdir -p %q", dir)
+	}
+	NewGuestSuspendTask(s, ctx, func(_ *SGuestSuspendTask, memStatPath string) {
+		log.Infof("Memory state file %q saved, move it to %q", memStatPath, memSnapPath)
+		sizeBytes := fileutils2.FileSize(memStatPath)
+		sizeMB := sizeBytes / 1024
+		checksum, err := fileutils2.FastCheckSum(memStatPath)
+		if err != nil {
+			hostutils.TaskFailed(ctx, fmt.Sprintf("calculate statefile %q checksum: %v", memStatPath, err))
+			return
+		}
+		if err := procutils.NewRemoteCommandAsFarAsPossible("mv", memStatPath, memSnapPath).Run(); err != nil {
+			hostutils.TaskFailed(ctx, fmt.Sprintf("move statefile %q to memory snapshot %q: %v", memStatPath, memSnapPath, err))
+			return
+		}
+		resumeTask := NewGuestResumeTask(ctx, s, false, false)
+		resumeTask.SetGetTaskData(func() (jsonutils.JSONObject, error) {
+			resp := &hostapi.GuestMemorySnapshotResponse{
+				MemorySnapshotPath: memSnapPath,
+				SizeMB:             sizeMB,
+				Checksum:           checksum,
+			}
+			return jsonutils.Marshal(resp), nil
+		})
+		resumeTask.Start()
+	}).Start()
+	return nil, nil
+}
+
+func (s *SKVMGuestInstance) ExecMemorySnapshotResetTask(ctx context.Context, input *hostapi.GuestMemorySnapshotResetRequest) (jsonutils.JSONObject, error) {
+	if !s.IsStopped() {
+		return nil, errors.Errorf("Server is not stopped status")
+	}
+	memStatPath := s.GetStateFilePath("")
+	if err := procutils.NewRemoteCommandAsFarAsPossible("ln", "-s", input.Path, memStatPath).Run(); err != nil {
+		hostutils.TaskFailed(ctx, fmt.Sprintf("move %q to %q: %v", input.Path, memStatPath, err))
+		return nil, err
+	}
+	if input.Checksum != "" {
+		handleErr := func(msg string) error {
+			// remove linked snapshot path
+			if err := procutils.NewRemoteCommandAsFarAsPossible("unlink", memStatPath).Run(); err != nil {
+				msg = errors.Wrapf(err, "unlink statfile cause %s", msg).Error()
+			}
+			hostutils.TaskFailed(ctx, msg)
+			return errors.Error(msg)
+		}
+		checksum, err := fileutils2.FastCheckSum(memStatPath)
+		if err != nil {
+			return nil, handleErr(fmt.Sprintf("calculate statefile %s checksum: %v", memStatPath, err))
+		}
+		if checksum != input.Checksum {
+			data := jsonutils.NewDict()
+			data.Set("name", jsonutils.NewString(input.InstanceSnapshotId))
+			notifyclient.SystemExceptionNotifyWithResult(context.Background(), noapi.ActionChecksumTest, noapi.TOPIC_RESOURCE_SNAPSHOT, noapi.ResultFailed, data)
+			return nil, handleErr(fmt.Sprintf("calculate checksum %s != %s", checksum, input.Checksum))
+		}
+	}
+	hostutils.TaskComplete(ctx, nil)
+	return nil, nil
 }
 
 func (s *SKVMGuestInstance) PrepareDisksMigrate(liveMigrage bool) (*jsonutils.JSONDict, error) {
@@ -1837,4 +2069,39 @@ func (s *SKVMGuestInstance) getQemuCmdlineFromContent(content string) (string, e
 		return "", errors.Errorf("Not found CMD content")
 	}
 	return cmdStr, nil
+}
+
+func (s *SKVMGuestInstance) CPUSet(ctx context.Context, input *api.ServerCPUSetInput) (*api.ServerCPUSetResp, error) {
+	if !s.IsRunning() {
+		return nil, nil
+	}
+	cpus := []string{}
+	for _, id := range input.CPUS {
+		cpus = append(cpus, fmt.Sprintf("%d", id))
+	}
+	task := cgrouputils.NewCGroupCPUSetTask(strconv.Itoa(s.GetPid()), 0, strings.Join(cpus, ","))
+	if !task.SetTask() {
+		return nil, errors.Errorf("Cgroup cpuset task failed")
+	}
+	return new(api.ServerCPUSetResp), nil
+}
+
+func (s *SKVMGuestInstance) CPUSetRemove(ctx context.Context) error {
+	metadata, err := s.Desc.Get("metadata")
+	if err != nil {
+		return errors.Wrap(err, "get metadata from desc")
+	}
+	metadata.(*jsonutils.JSONDict).Remove(api.VM_METADATA_CGROUP_CPUSET)
+	s.Desc.Set("metadata", metadata)
+	if err := s.SaveDesc(s.Desc); err != nil {
+		return errors.Wrap(err, "save desc after update metadata")
+	}
+	if !s.IsRunning() {
+		return nil
+	}
+	task := cgrouputils.NewCGroupCPUSetTask(strconv.Itoa(s.GetPid()), 0, "")
+	if !task.RemoveTask() {
+		return errors.Errorf("Remove task error happened, please lookup host log")
+	}
+	return nil
 }

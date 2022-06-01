@@ -49,7 +49,7 @@ CGO_LDFLAGS_ENV = $(shell go env CGO_LDFLAGS)
 
 ifdef LIBQEMUIO_PATH
 		X_CGO_CFLAGS := ${CGO_CFLAGS_ENV} -I${LIBQEMUIO_PATH}/src -I${LIBQEMUIO_PATH}/src/include
-		X_CGO_LDFLAGS := ${CGO_LDFLAGS_ENV} -laio -lqemuio -lpthread  -L ${LIBQEMUIO_PATH}/src
+		X_CGO_LDFLAGS := ${CGO_LDFLAGS_ENV} -laio -lqemuio -lpthread -lgnutls -lnettle -L ${LIBQEMUIO_PATH}/src
 endif
 
 export GOOS ?= linux
@@ -330,7 +330,7 @@ image:
 .PHONY: image
 
 image-telegraf-raid-plugin:
-	VERSION=release-1.6.1 ARCH=all make image telegraf-raid-plugin
+	VERSION=release-1.6.3 ARCH=all make image telegraf-raid-plugin
 
 %:
 	@:

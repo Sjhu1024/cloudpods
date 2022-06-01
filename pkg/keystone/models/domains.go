@@ -58,10 +58,14 @@ func init() {
 type SDomain struct {
 	db.SStandaloneResourceBase
 
+	// 额外信息
 	Extra *jsonutils.JSONDict `nullable:"true"`
 
-	Enabled  tristate.TriState `nullable:"false" default:"true" list:"admin" update:"admin" create:"admin_optional"`
-	IsDomain tristate.TriState `default:"false" nullable:"false"`
+	// 改域是否启用
+	Enabled tristate.TriState `default:"true" list:"admin" update:"admin" create:"admin_optional"`
+
+	// 是否为域
+	IsDomain tristate.TriState `default:"false"`
 
 	// IdpId string `token:"parent_id" width:"64" charset:"ascii" index:"true" list:"admin"`
 
@@ -373,9 +377,9 @@ func (manager *SDomainManager) FetchCustomizeColumns(
 		}
 		domain := objs[i].(*SDomain)
 		idList[i] = domain.Id
-		rows[i].UserCout, _ = domain.GetUserCount()
+		rows[i].UserCount, _ = domain.GetUserCount()
 		rows[i].GroupCount, _ = domain.GetGroupCount()
-		rows[i].ProjectCout, _ = domain.GetProjectCount()
+		rows[i].ProjectCount, _ = domain.GetProjectCount()
 		rows[i].RoleCount, _ = domain.GetRoleCount()
 		rows[i].PolicyCount, _ = domain.GetPolicyCount()
 		rows[i].IdpCount, _ = domain.GetIdpCount()

@@ -15,10 +15,13 @@
 package backupstorage
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
 	"yunion.io/x/jsonutils"
 
+	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 )
 
@@ -29,7 +32,12 @@ type IBackupStorage interface {
 	IsExists(backupId string) (bool, error)
 	ConvertTo(destPath string, format qemuimg.TImageFormat, backupId string) error
 	ConvertFrom(srcPath string, format qemuimg.TImageFormat, backupId string) (int, error)
+	InstancePack(ctx context.Context, packageName string, backupIds []string, metadata *api.InstanceBackupPackMetadata) (string, error)
+	InstanceUnpack(ctx context.Context, packageName string, metadataOnly bool) ([]string, *api.InstanceBackupPackMetadata, error)
+	IsOnline() (bool, string, error)
 }
+
+var backupStoragePool *sync.Map = &sync.Map{}
 
 func NewBackupStorage(backupStroageId string, backupStorageAccessInfo *jsonutils.JSONDict) (IBackupStorage, error) {
 	nfsHost, err := backupStorageAccessInfo.GetString("nfs_host")
@@ -41,4 +49,13 @@ func NewBackupStorage(backupStroageId string, backupStorageAccessInfo *jsonutils
 		return nil, fmt.Errorf("need nfs_shared_dir in backup_storage_access_info")
 	}
 	return NewNFSBackupStorage(backupStroageId, nfsHost, nfsSharedDir), nil
+}
+
+func GetBackupStorage(backupStroageId string, backupStorageAccessInfo *jsonutils.JSONDict) (IBackupStorage, error) {
+	bs, err := NewBackupStorage(backupStroageId, backupStorageAccessInfo)
+	if err != nil {
+		return nil, err
+	}
+	ibs, _ := backupStoragePool.LoadOrStore(backupStroageId, bs)
+	return ibs.(IBackupStorage), nil
 }

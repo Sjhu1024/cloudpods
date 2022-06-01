@@ -17,6 +17,7 @@ package compute
 import (
 	"yunion.io/x/onecloud/cmd/climc/shell"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	"yunion.io/x/onecloud/pkg/mcclient/options"
 	"yunion.io/x/onecloud/pkg/mcclient/options/compute"
 )
 
@@ -26,11 +27,14 @@ func init() {
 	bsCmd.Show(&compute.BackupStorageIdOptions{})
 	bsCmd.Create(&compute.BackupStorageCreateOptions{})
 	bsCmd.Delete(&compute.BackupStorageIdOptions{})
+	bsCmd.Perform("public", &options.BasePublicOptions{})
+	bsCmd.Perform("private", &options.BaseIdOptions{})
+	bsCmd.Perform("syncstatus", &compute.DiskBackupSyncstatusOptions{})
 
 	dbCmd := shell.NewResourceCmd(&modules.DiskBackups)
 	dbCmd.List(&compute.DiskBackupListOptions{})
 	dbCmd.Show(&compute.DiskBackupIdOptions{})
-	dbCmd.Delete(&compute.DiskBackupIdOptions{})
+	dbCmd.DeleteWithParam(&compute.DiskBackupDeleteOptions{})
 	dbCmd.Create(&compute.DiskBackupCreateOptions{})
 	dbCmd.Perform("recovery", &compute.DiskBackupRecoveryOptions{})
 	dbCmd.Perform("syncstatus", &compute.DiskBackupSyncstatusOptions{})
@@ -38,6 +42,11 @@ func init() {
 	ibCmd := shell.NewResourceCmd(&modules.InstanceBackups)
 	ibCmd.List(&compute.InstanceBackupListOptions{})
 	ibCmd.Show(&compute.InstanceBackupIdOptions{})
-	ibCmd.Delete(&compute.InstanceBackupIdOptions{})
+	ibCmd.DeleteWithParam(&compute.InstanceBackupDeleteOptions{})
 	ibCmd.Perform("recovery", &compute.InstanceBackupRecoveryOptions{})
+	ibCmd.Perform("pack", &compute.InstanceBackupPackOptions{})
+	// ibCmd.PerformClass("create-from-package", &compute.InstanceBackupManagerCreateFromPackageOptions{})
+	ibCmd.Create(&compute.InstanceBackupManagerCreateFromPackageOptions{})
+	ibCmd.Perform("syncstatus", &compute.DiskBackupSyncstatusOptions{})
+	ibCmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
 }

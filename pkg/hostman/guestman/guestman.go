@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -41,11 +42,14 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
+	"yunion.io/x/onecloud/pkg/hostman/storageman/remotefile"
 	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/util/cgrouputils"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
+	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/timeutils2"
 )
 
@@ -118,6 +122,10 @@ func (m *SGuestManager) GetUnknownServer(sid string) (*SKVMGuestInstance, bool) 
 
 func (m *SGuestManager) SaveServer(sid string, s *SKVMGuestInstance) {
 	m.Servers.Store(sid, s)
+}
+
+func (m *SGuestManager) CleanServer(sid string) {
+	m.Servers.Delete(sid)
 }
 
 func (m *SGuestManager) Bootstrap() chan struct{} {
@@ -252,6 +260,22 @@ func (m *SGuestManager) cpusetBalance() {
 	if !options.HostOptions.DisableSetCgroup {
 		cgrouputils.RebalanceProcesses(nil)
 	}
+}
+
+func (m *SGuestManager) CPUSet(ctx context.Context, sid string, req *compute.ServerCPUSetInput) (*compute.ServerCPUSetResp, error) {
+	guest, ok := m.GetServer(sid)
+	if !ok {
+		return nil, httperrors.NewNotFoundError("Not found")
+	}
+	return guest.CPUSet(ctx, req)
+}
+
+func (m *SGuestManager) CPUSetRemove(ctx context.Context, sid string) error {
+	guest, ok := m.GetServer(sid)
+	if !ok {
+		return httperrors.NewNotFoundError("Not found")
+	}
+	return guest.CPUSetRemove(ctx)
 }
 
 func (m *SGuestManager) IsGuestDir(f os.FileInfo) bool {
@@ -588,9 +612,10 @@ func (m *SGuestManager) startDeploy(
 	enableCloudInit := jsonutils.QueryBoolean(deployParams.Body, "enable_cloud_init", false)
 	loginAccount, _ := deployParams.Body.GetString("login_account")
 
-	guestInfo, err := guest.DeployFs(deployapi.NewDeployInfo(
-		publicKey, deployapi.JsonDeploysToStructs(deploys), password, deployParams.IsInit, false,
-		options.HostOptions.LinuxDefaultRootUser, options.HostOptions.WindowsDefaultAdminUser, enableCloudInit, loginAccount))
+	guestInfo, err := guest.DeployFs(ctx, deployParams.UserCred,
+		deployapi.NewDeployInfo(
+			publicKey, deployapi.JsonDeploysToStructs(deploys), password, deployParams.IsInit, false,
+			options.HostOptions.LinuxDefaultRootUser, options.HostOptions.WindowsDefaultAdminUser, enableCloudInit, loginAccount))
 	if err != nil {
 		return nil, errors.Wrap(err, "Deploy guest fs")
 	} else {
@@ -679,7 +704,7 @@ func (m *SGuestManager) getStatus(sid string) string {
 
 func (m *SGuestManager) Delete(sid string) (*SKVMGuestInstance, error) {
 	if guest, ok := m.GetServer(sid); ok {
-		m.Servers.Delete(sid)
+		m.CleanServer(sid)
 		// 这里应该不需要append到deleted servers
 		// 据观察 deleted servers 目的是为了给ofp_delegate使用，ofp已经不用了
 		return guest, nil
@@ -691,7 +716,7 @@ func (m *SGuestManager) Delete(sid string) (*SKVMGuestInstance, error) {
 	}
 }
 
-func (m *SGuestManager) GuestStart(ctx context.Context, sid string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+func (m *SGuestManager) GuestStart(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	if guest, ok := m.GetServer(sid); ok {
 		if desc, err := body.Get("desc"); err == nil {
 			guest.SaveDesc(desc)
@@ -703,7 +728,7 @@ func (m *SGuestManager) GuestStart(ctx context.Context, sid string, body jsonuti
 				Params: jsonutils.NewDict(),
 			}
 			body.Unmarshal(&data)
-			guest.StartGuest(ctx, data.Params)
+			guest.StartGuest(ctx, userCred, data.Params)
 			res := jsonutils.NewDict()
 			res.Set("vnc_port", jsonutils.NewInt(0))
 			return res, nil
@@ -827,6 +852,16 @@ func (m *SGuestManager) DestPrepareMigrate(ctx context.Context, params interface
 
 	}
 
+	body := jsonutils.NewDict()
+
+	if len(migParams.SrcMemorySnapshots) > 0 {
+		preparedMs, err := m.destinationPrepareMigrateMemorySnapshots(ctx, migParams.Sid, migParams.MemorySnapshotsUri, migParams.SrcMemorySnapshots)
+		if err != nil {
+			return nil, errors.Wrap(err, "destination prepare migrate memory snapshots")
+		}
+		body.Add(jsonutils.Marshal(preparedMs), "dest_prepared_memory_snapshots")
+	}
+
 	if migParams.LiveMigrate {
 		startParams := jsonutils.NewDict()
 		startParams.Set("qemu_version", jsonutils.NewString(migParams.QemuVersion))
@@ -838,12 +873,36 @@ func (m *SGuestManager) DestPrepareMigrate(ctx context.Context, params interface
 				return nil, errors.Wrap(err, "write migrate certs")
 			}
 		}
+		var err error
+		startParams, err = guest.prepareEncryptKeyForStart(ctx, migParams.UserCred, startParams)
+		if err != nil {
+			return nil, errors.Wrap(err, "prepareEncryptKeyForStart")
+		}
 		hostutils.DelayTaskWithoutReqctx(ctx, guest.asyncScriptStart, startParams)
 	} else {
 		hostutils.UpdateServerProgress(context.Background(), migParams.Sid, 100.0, 0)
 	}
 
-	return nil, nil
+	return body, nil
+}
+
+func (m *SGuestManager) destinationPrepareMigrateMemorySnapshots(ctx context.Context, serverId string, uri string, ids []string) (map[string]string, error) {
+	ret := make(map[string]string, 0)
+	for _, id := range ids {
+		url := fmt.Sprintf("%s/%s/%s", uri, serverId, id)
+		msPath := GetMemorySnapshotPath(serverId, id)
+		dir := filepath.Dir(msPath)
+		if err := procutils.NewRemoteCommandAsFarAsPossible("mkdir", "-p", dir).Run(); err != nil {
+			return nil, errors.Wrapf(err, "mkdir -p %q", dir)
+		}
+		remotefile := remotefile.NewRemoteFile(ctx, url, msPath, false, "", -1, nil, "", "")
+		if err := remotefile.Fetch(nil); err != nil {
+			return nil, errors.Wrapf(err, "fetch memory snapshot file %s", url)
+		} else {
+			ret[id] = msPath
+		}
+	}
+	return ret, nil
 }
 
 func (m *SGuestManager) LiveMigrate(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
@@ -868,7 +927,7 @@ func (m *SGuestManager) CanMigrate(sid string) bool {
 	}
 
 	guest := NewKVMGuestInstance(sid, m)
-	m.Servers.Store(sid, guest)
+	m.SaveServer(sid, guest)
 	return true
 }
 
@@ -927,7 +986,7 @@ func (m *SGuestManager) DoSnapshot(ctx context.Context, params interface{}) (jso
 		return nil, hostutils.ParamsError
 	}
 	guest, _ := m.GetServer(snapshotParams.Sid)
-	return guest.ExecDiskSnapshotTask(ctx, snapshotParams.Disk, snapshotParams.SnapshotId)
+	return guest.ExecDiskSnapshotTask(ctx, snapshotParams.UserCred, snapshotParams.Disk, snapshotParams.SnapshotId)
 }
 
 func (m *SGuestManager) DeleteSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
@@ -945,6 +1004,41 @@ func (m *SGuestManager) DeleteSnapshot(ctx context.Context, params interface{}) 
 		res.Set("deleted", jsonutils.JSONTrue)
 		return res, delParams.Disk.DeleteSnapshot(delParams.DeleteSnapshot, "", false)
 	}
+}
+
+func (m *SGuestManager) DoMemorySnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	input, ok := params.(*SMemorySnapshot)
+	if !ok {
+		return nil, hostutils.ParamsError
+	}
+
+	guest, _ := m.GetServer(input.Sid)
+	return guest.ExecMemorySnapshotTask(ctx, input.GuestMemorySnapshotRequest)
+}
+
+func (m *SGuestManager) DoResetMemorySnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	input, ok := params.(*SMemorySnapshotReset)
+	if !ok {
+		return nil, hostutils.ParamsError
+	}
+
+	guest, _ := m.GetServer(input.Sid)
+	return guest.ExecMemorySnapshotResetTask(ctx, input.GuestMemorySnapshotResetRequest)
+}
+
+func (m *SGuestManager) DoDeleteMemorySnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	input, ok := params.(*SMemorySnapshotDelete)
+	if !ok {
+		return nil, hostutils.ParamsError
+	}
+
+	if err := procutils.NewRemoteCommandAsFarAsPossible("rm", input.Path).Run(); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "No such file or directory") {
+			return nil, err
+		}
+	}
+	log.Infof("Memory snapshot file %q removed", input.Path)
+	return nil, nil
 }
 
 func (m *SGuestManager) Resume(ctx context.Context, sid string, isLiveMigrate bool, cleanTLS bool) (jsonutils.JSONObject, error) {

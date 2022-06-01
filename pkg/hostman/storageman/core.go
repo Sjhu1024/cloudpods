@@ -43,7 +43,7 @@ import (
 const MINIMAL_FREE_SPACE = 128
 
 type IStorageManager interface {
-	GetZoneName() string
+	GetZoneId() string
 }
 
 type SStorageManager struct {
@@ -114,8 +114,8 @@ func (s *SStorageManager) Remove(storage IStorage) {
 	}
 }
 
-func (s *SStorageManager) GetZoneName() string {
-	return s.host.GetZoneName()
+func (s *SStorageManager) GetZoneId() string {
+	return s.host.GetZoneId()
 }
 
 func (s *SStorageManager) GetHostId() string {
@@ -373,26 +373,43 @@ func CleanRecycleDiskfiles(ctx context.Context, userCred mcclient.TokenCredentia
 	}
 }
 
-func StartSyncStorageSizeTask(interval time.Duration) {
-	log.Infof("Start sync storage size task !!!")
-	for {
-		time.Sleep(interval)
-		manager := GetManager()
-		for i := 0; i < len(manager.Storages); i++ {
-			iS := manager.Storages[i]
-			if iS.StorageType() == api.STORAGE_LOCAL || iS.StorageType() == api.STORAGE_RBD {
-				err := iS.SyncStorageSize()
-				if err != nil {
-					log.Errorf("sync storage %s size failed: %s", iS.GetStorageName(), err)
-				}
-			}
-		}
-		err := manager.host.SyncRootPartitionUsedCapacity()
+func GatherHostStorageStats() api.SHostPingInput {
+	stats := api.SHostPingInput{}
+	stats.RootPartitionUsedCapacityMb = GetRootPartUsedCapacity()
+	manager := GetManager()
+	for i := 0; i < len(manager.Storages); i++ {
+		iS := manager.Storages[i]
+		stat, err := iS.SyncStorageSize()
 		if err != nil {
-			log.Errorf("sync root partition used size failed: %s", err)
+			log.Errorf("sync storage %s size failed: %s", iS.GetStorageName(), err)
+		} else {
+			stat.StorageId = iS.GetId()
+			stats.StorageStats = append(stats.StorageStats, stat)
 		}
 	}
+	return stats
 }
+
+// func StartSyncStorageSizeTask(interval time.Duration) {
+//	log.Infof("Start sync storage size task !!!")
+//	for {
+//		time.Sleep(interval)
+//		manager := GetManager()
+//		for i := 0; i < len(manager.Storages); i++ {
+//			iS := manager.Storages[i]
+//			if iS.StorageType() == api.STORAGE_LOCAL || iS.StorageType() == api.STORAGE_RBD {
+//				err := iS.SyncStorageSize()
+//				if err != nil {
+//					log.Errorf("sync storage %s size failed: %s", iS.GetStorageName(), err)
+//				}
+//			}
+//		}
+//		err := manager.host.SyncRootPartitionUsedCapacity()
+//		if err != nil {
+//			log.Errorf("sync root partition used size failed: %s", err)
+//		}
+//	}
+// }
 
 func GetRootPartTotalCapacity() int {
 	size, err := storageutils.GetTotalSizeMb("/")

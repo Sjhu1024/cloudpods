@@ -65,6 +65,15 @@ func AddStorageHandler(prefix string, app *appsrv.Application) {
 		app.AddHandler("POST",
 			fmt.Sprintf("%s/%s/sync-backup", prefix, keyWords),
 			auth.Authenticate(storageSyncBackup))
+		app.AddHandler("POST",
+			fmt.Sprintf("%s/%s/pack-instance-backup", prefix, keyWords),
+			auth.Authenticate(storagePackInstanceBackup))
+		app.AddHandler("POST",
+			fmt.Sprintf("%s/%s/unpack-instance-backup", prefix, keyWords),
+			auth.Authenticate(storageUnpackInstanceBackup))
+		app.AddHandler("POST",
+			fmt.Sprintf("%s/%s/sync-backup-storage", prefix, keyWords),
+			auth.Authenticate(storageSyncBackupStorage))
 	}
 }
 
@@ -125,10 +134,10 @@ func storageAttach(ctx context.Context, body jsonutils.JSONObject) (interface{},
 	if err := storage.SetStorageInfo(storageId, storageName, storageConf); err != nil {
 		return nil, err
 	}
-	err = storage.SyncStorageSize()
+	/*err = storage.SyncStorageSize()
 	if err != nil {
 		return nil, errors.Wrapf(err, "SyncStorageSize")
-	}
+	}*/
 	resp, err := storage.SyncStorageInfo()
 	if err != nil {
 		return nil, err
@@ -208,7 +217,7 @@ func storageSyncBackup(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_access_info"))
 		return
 	}
-	backupStorage, err := backupstorage.NewBackupStorage(backupStorageId, backupStorageAccessInfo.(*jsonutils.JSONDict))
+	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo.(*jsonutils.JSONDict))
 	if err != nil {
 		hostutils.Response(ctx, w, err)
 		return
@@ -232,6 +241,108 @@ func storageSyncBackup(ctx context.Context, w http.ResponseWriter, r *http.Reque
 	}
 	ret.Set("status", jsonutils.NewString(status))
 	hostutils.Response(ctx, w, ret)
+}
+
+func storageSyncBackupStorage(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, _, body := appsrv.FetchEnv(ctx, w, r)
+	backupStorageId, err := body.GetString("backup_storage_id")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_id"))
+		return
+	}
+	backupStorageAccessInfo, err := body.Get("backup_storage_access_info")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_access_info"))
+		return
+	}
+	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo.(*jsonutils.JSONDict))
+	if err != nil {
+		hostutils.Response(ctx, w, err)
+		return
+	}
+	exist, reason, err := backupStorage.IsOnline()
+	if err != nil {
+		hostutils.Response(ctx, w, err)
+		return
+	}
+	var (
+		ret    = jsonutils.NewDict()
+		status string
+	)
+	if exist {
+		status = compute.BACKUPSTORAGE_STATUS_ONLINE
+	} else {
+		status = compute.BACKUPSTORAGE_STATUS_OFFLINE
+	}
+	ret.Set("status", jsonutils.NewString(status))
+	ret.Set("reason", jsonutils.NewString(reason))
+	hostutils.Response(ctx, w, ret)
+}
+
+func storagePackInstanceBackup(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, _, body := appsrv.FetchEnv(ctx, w, r)
+	if !checkOptions(ctx, w, body, "package_name", "backup_ids", "backup_storage_id", "backup_storage_access_info", "metadata") {
+		return
+	}
+	pb := storageman.SStoragePackInstanceBackup{}
+	err := body.Unmarshal(&pb)
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError(err.Error()))
+		return
+	}
+
+	hostutils.DelayTask(ctx, packInstanceBackup, &pb)
+	hostutils.ResponseOk(ctx, w)
+}
+
+func storageUnpackInstanceBackup(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, _, body := appsrv.FetchEnv(ctx, w, r)
+	if !checkOptions(ctx, w, body, "package_name", "backup_storage_id", "backup_storage_access_info") {
+		return
+	}
+	pb := storageman.SStorageUnpackInstanceBackup{}
+	err := body.Unmarshal(&pb)
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError(err.Error()))
+		return
+	}
+
+	hostutils.DelayTask(ctx, unpackInstanceBackup, &pb)
+	hostutils.ResponseOk(ctx, w)
+}
+
+func packInstanceBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	sbParams := params.(*storageman.SStoragePackInstanceBackup)
+	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetBackupStorage")
+	}
+	packFileName, err := backupStorage.InstancePack(ctx, sbParams.PackageName, sbParams.BackupIds, &sbParams.Metadata)
+	if err != nil {
+		return nil, errors.Wrap(err, "InstancePack")
+	}
+	ret := jsonutils.NewDict()
+	ret.Set("pack_file_name", jsonutils.NewString(packFileName))
+	return ret, nil
+}
+
+func unpackInstanceBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	sbParams := params.(*storageman.SStorageUnpackInstanceBackup)
+	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetBackupStorage")
+	}
+	metadataOnly := (sbParams.MetadataOnly != nil && *sbParams.MetadataOnly)
+	diskBackupIds, metadata, err := backupStorage.InstanceUnpack(ctx, sbParams.PackageName, metadataOnly)
+	if err != nil {
+		return nil, errors.Wrap(err, "InstanceUnpack")
+	}
+	ret := jsonutils.NewDict()
+	if diskBackupIds != nil {
+		ret.Set("disk_backup_ids", jsonutils.Marshal(diskBackupIds))
+	}
+	ret.Set("metadata", jsonutils.Marshal(metadata))
+	return ret, nil
 }
 
 func storageDeleteBackup(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -259,9 +370,20 @@ func storageDeleteBackup(ctx context.Context, w http.ResponseWriter, r *http.Req
 	hostutils.ResponseOk(ctx, w)
 }
 
+func checkOptions(ctx context.Context, w http.ResponseWriter, body jsonutils.JSONObject, options ...string) bool {
+	for _, option := range options {
+		if body.Contains(option) {
+			continue
+		}
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError(option))
+		return false
+	}
+	return true
+}
+
 func deleteBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	sbParams := params.(*storageman.SStorageBackup)
-	backupStorage, err := backupstorage.NewBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
 	if err != nil {
 		return nil, err
 	}

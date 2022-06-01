@@ -30,14 +30,19 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/onecloud/cmd/climc/shell"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
+	compute_options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
 	"yunion.io/x/onecloud/pkg/util/httputils"
 	"yunion.io/x/onecloud/pkg/util/sparsefile"
 )
 
 func init() {
+	cmd := shell.NewResourceCmd(&modules.Disks)
+	cmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
+
 	type DiskListOptions struct {
 		options.BaseListOptions
 		Unused    *bool  `help:"Show unused disks"`
@@ -209,7 +214,7 @@ func init() {
 		return nil
 	})
 
-	R(&options.DiskCreateOptions{}, "disk-create", "Create a virtual disk", func(s *mcclient.ClientSession, args *options.DiskCreateOptions) error {
+	R(&compute_options.DiskCreateOptions{}, "disk-create", "Create a virtual disk", func(s *mcclient.ClientSession, args *compute_options.DiskCreateOptions) error {
 		params, err := args.Params()
 		if err != nil {
 			return err
@@ -372,7 +377,7 @@ func init() {
 			url := fmt.Sprintf("%s/download/disks/%s/%s", managerUri, storageId, args.ID)
 			resp, err := httputils.Request(client, context.Background(), httputils.GET, url, header, nil, args.Debug)
 			if err != nil {
-				log.Errorf("request %s error: %v", err)
+				log.Errorf("request %s error: %v", url, err)
 				continue
 			}
 			defer resp.Body.Close()

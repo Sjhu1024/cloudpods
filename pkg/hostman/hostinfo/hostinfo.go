@@ -27,33 +27,38 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/vishvananda/netlink"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	identityapi "yunion.io/x/onecloud/pkg/apis/identity"
+	napi "yunion.io/x/onecloud/pkg/apis/notify"
+	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
 	"yunion.io/x/onecloud/pkg/hostman/host_health"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostbridge"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
+	"yunion.io/x/onecloud/pkg/hostman/hostutils/hardware"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils/kubelet"
 	"yunion.io/x/onecloud/pkg/hostman/isolated_device"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/hostman/system_service"
+	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/util/cgrouputils"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/k8s/tokens"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemutils"
@@ -66,6 +71,7 @@ type SHostInfo struct {
 	IsRegistered     chan struct{}
 	registerCallback func()
 	stopped          bool
+	isLoged          bool
 
 	saved  bool
 	pinger *SHostPingTask
@@ -131,8 +137,8 @@ func (h *SHostInfo) GetHostId() string {
 	return h.HostId
 }
 
-func (h *SHostInfo) GetZoneName() string {
-	return h.Zone
+func (h *SHostInfo) GetZoneId() string {
+	return h.ZoneId
 }
 
 func (h *SHostInfo) GetMediumType() string {
@@ -328,12 +334,18 @@ func (h *SHostInfo) prepareEnv() error {
 		return fmt.Errorf("Option report_interval must no longer than 5 min")
 	}
 
-	output, err := procutils.NewCommand("mkdir", "-p", options.HostOptions.ServersPath).Output()
-	if err != nil {
-		return errors.Wrapf(err, "failed to create path %s: %s", options.HostOptions.ServersPath, output)
+	for _, dirPath := range []string{
+		options.HostOptions.ServersPath,
+		options.HostOptions.MemorySnapshotsPath,
+		options.HostOptions.LocalBackupTempPath,
+	} {
+		output, err := procutils.NewCommand("mkdir", "-p", dirPath).Output()
+		if err != nil {
+			return errors.Wrapf(err, "failed to create path %s: %s", dirPath, output)
+		}
 	}
 
-	_, err = procutils.NewCommand("ethtool", "-h").Output()
+	_, err := procutils.NewCommand("ethtool", "-h").Output()
 	if err != nil {
 		return errors.Wrap(err, "Execute 'ethtool -h'")
 	}
@@ -381,7 +393,7 @@ func (h *SHostInfo) prepareEnv() error {
 	if err != nil {
 		return errors.Wrap(err, "Failed to activate tun/tap device")
 	}
-	output, err = procutils.NewRemoteCommandAsFarAsPossible("modprobe", "vhost_net").Output()
+	output, err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", "vhost_net").Output()
 	if err != nil {
 		log.Warningf("modprobe vhost_net error: %s", output)
 	}
@@ -416,10 +428,10 @@ func (h *SHostInfo) prepareEnv() error {
 		}
 		szlist := hp.PageSizes()
 		if len(szlist) == 0 {
-			return errors.New("invalid hugepages total size")
+			return errors.Error("invalid hugepages total size")
 		}
 		if len(szlist) > 1 {
-			return errors.New("cannot support more than 1 type of hugepage size")
+			return errors.Error("cannot support more than 1 type of hugepage size")
 		}
 		h.sysinfo.HugepageSizeKb = szlist[0]
 	case "transparent":
@@ -455,6 +467,12 @@ func (h *SHostInfo) detectHostInfo() error {
 	}
 
 	h.detectStorageSystem()
+
+	topoInfo, err := hardware.GetTopology()
+	if err != nil {
+		return errors.Wrap(err, "Get hardware topology")
+	}
+	h.sysinfo.Topology = topoInfo
 
 	system_service.Init()
 	if options.HostOptions.CheckSystemServices {
@@ -575,7 +593,7 @@ func (h *SHostInfo) EnableNativeHugepages(reservedMb int) error {
 			return nil
 		}
 	} else {
-		return errors.New("cannot support more than 1 type of hugepage sizes")
+		return errors.Error("cannot support more than 1 type of hugepage sizes")
 	}
 	mem := h.GetMemory()
 	if reservedMb > 0 {
@@ -852,6 +870,14 @@ func (h *SHostInfo) register() {
 }
 
 func (h *SHostInfo) onFail(reason interface{}) {
+	if len(h.HostId) > 0 && !h.isLoged {
+		logclient.AddSimpleActionLog(h, logclient.ACT_ONLINE, reason, hostutils.GetComputeSession(context.Background()).GetToken(), false)
+		data := jsonutils.NewDict()
+		data.Add(jsonutils.NewString(h.GetName()), "name")
+		data.Add(jsonutils.NewString(fmt.Sprintf("register failed: %v", reason)), "message")
+		notifyclient.SystemExceptionNotify(context.TODO(), napi.ActionSystemException, napi.TOPIC_RESOURCE_HOST, data)
+		h.isLoged = true
+	}
 	log.Errorf("register failed: %s", reason)
 	h.StartRegister(30, nil)
 	panic("register failed, try 30 seconds later...")
@@ -900,6 +926,7 @@ func (h *SHostInfo) fetchAccessNetworkInfo() {
 	params := jsonutils.NewDict()
 	params.Set("ip", jsonutils.NewString(masterIp))
 	params.Set("is_classic", jsonutils.JSONTrue)
+	params.Set("provider", jsonutils.NewString(api.CLOUD_PROVIDER_ONECLOUD))
 	params.Set("scope", jsonutils.NewString("system"))
 	params.Set("limit", jsonutils.NewInt(0))
 	// use default vpc
@@ -931,36 +958,36 @@ func (h *SHostInfo) onGetWireId(wireId string) {
 	if err != nil {
 		h.onFail(err)
 		return
-	} else {
-		h.getZoneInfo(h.ZoneId, false)
 	}
+	h.getZoneInfo(h.ZoneId)
 }
 
 func (h *SHostInfo) GetSession() *mcclient.ClientSession {
 	return hostutils.GetComputeSession(context.Background())
 }
 
-func (h *SHostInfo) getZoneInfo(zoneId string, standalone bool) {
-	log.Debugf("Start GetZoneInfo %s %v", zoneId, standalone)
+func (h *SHostInfo) getZoneInfo(zoneId string) {
+	log.Debugf("Start GetZoneInfo %s", zoneId)
 	var params = jsonutils.NewDict()
-	params.Set("standalone", jsonutils.NewBool(standalone))
-	res, err := modules.Zones.Get(h.GetSession(),
-		zoneId, params)
+	params.Set("provider", jsonutils.NewString(api.CLOUD_PROVIDER_ONECLOUD))
+	res, err := modules.Zones.Get(h.GetSession(), zoneId, params)
 	if err != nil {
 		h.onFail(err)
 		return
 	}
+	zone := api.ZoneDetails{}
+	jsonutils.Update(&zone, res)
+	h.Zone = zone.Name
+	h.ZoneId = zone.Id
+	h.Cloudregion = zone.Cloudregion
+	h.CloudregionId = zone.CloudregionId
+	h.ZoneManagerUri = zone.ManagerUri
+	if len(h.Zone) == 0 {
+		h.onFail(fmt.Errorf("failed to found zone with id %s", zoneId))
+		return
+	}
 
-	h.Zone, _ = res.GetString("name")
-	h.ZoneId, _ = res.GetString("id")
-	h.Cloudregion, _ = res.GetString("cloudregion")
-	h.CloudregionId, _ = res.GetString("cloudregion_id")
-	if res.Contains("manager_uri") {
-		h.ZoneManagerUri, _ = res.GetString("manager_uri")
-	}
-	if !standalone {
-		h.getHostInfo(h.ZoneId)
-	}
+	h.getHostInfo(h.ZoneId)
 }
 
 func (h *SHostInfo) getHostInfo(zoneId string) {
@@ -971,33 +998,40 @@ func (h *SHostInfo) getHostInfo(zoneId string) {
 	}
 	params := jsonutils.NewDict()
 	params.Set("any_mac", jsonutils.NewString(masterMac))
+	params.Set("provider", jsonutils.NewString(api.CLOUD_PROVIDER_ONECLOUD))
+	params.Set("details", jsonutils.JSONTrue)
 	params.Set("scope", jsonutils.NewString("system"))
 	res, err := modules.Hosts.List(h.GetSession(), params)
 	if err != nil {
 		h.onFail(err)
 		return
 	}
-	if len(res.Data) == 0 {
+	hosts := []api.HostDetails{}
+	jsonutils.Update(&hosts, res.Data)
+	if len(hosts) == 0 {
 		h.updateHostRecord("")
-	} else {
-		host := res.Data[0]
-		id, _ := host.GetString("id")
-		h.getDomainInfo(id)
-
-		h.updateHostRecord(id)
-	}
-}
-
-func (h *SHostInfo) getDomainInfo(hostId string) {
-	host, err := modules.Hosts.GetById(h.GetSession(), hostId, jsonutils.NewDict())
-	if err != nil {
-		h.onFail(err)
 		return
 	}
-	domain_id, _ := host.GetString("domain_id")
-	project_domain, _ := host.GetString("project_domain")
-	h.Domain_id = domain_id
-	h.Project_domain = strings.ReplaceAll(project_domain, " ", "+")
+	if len(hosts) > 1 {
+		for i := range hosts {
+			h.HostId = hosts[i].Id
+			logclient.AddSimpleActionLog(h, logclient.ACT_ONLINE, fmt.Errorf("duplicate host with %s", params), hostutils.GetComputeSession(context.Background()).GetToken(), false)
+		}
+		return
+	}
+	h.Domain_id = hosts[0].DomainId
+	h.HostId = hosts[0].Id
+	h.Project_domain = strings.ReplaceAll(hosts[0].ProjectDomain, " ", "+")
+	// 上次未能正常offline, 补充一次健康日志
+	if hosts[0].HostStatus == api.HOST_ONLINE {
+		reason := fmt.Sprintf("The host status is online when it staring. Maybe the control center was down earlier")
+		logclient.AddSimpleActionLog(h, logclient.ACT_HEALTH_CHECK, map[string]string{"reason": reason}, hostutils.GetComputeSession(context.Background()).GetToken(), false)
+		data := jsonutils.NewDict()
+		data.Add(jsonutils.NewString(h.GetName()), "name")
+		data.Add(jsonutils.NewString(reason), "message")
+		notifyclient.SystemExceptionNotify(context.TODO(), napi.ActionSystemException, napi.TOPIC_RESOURCE_HOST, data)
+	}
+	h.updateHostRecord(hosts[0].Id)
 }
 
 func (h *SHostInfo) UpdateSyncInfo(hostId string, body jsonutils.JSONObject) (interface{}, error) {
@@ -1064,76 +1098,79 @@ func (h *SHostInfo) updateHostRecord(hostId string) {
 	if len(hostId) == 0 {
 		h.isInit = true
 	}
-	content := jsonutils.NewDict()
 	masterIp := h.GetMasterIp()
 	if len(masterIp) == 0 {
 		h.onFail("master ip is none")
 		return
 	}
 
+	input := api.HostCreateInput{}
 	if len(hostId) == 0 {
-		content.Set("generate_name", jsonutils.NewString(h.fetchHostname()))
+		input.GenerateName = h.fetchHostname()
 	}
-	content.Set("access_ip", jsonutils.NewString(masterIp))
-	content.Set("access_mac", jsonutils.NewString(h.GetMasterMac()))
+	input.AccessIp = masterIp
+	input.AccessMac = h.GetMasterMac()
 	var schema = "http"
 	if options.HostOptions.EnableSsl {
 		schema = "https"
 	}
-	content.Set("manager_uri", jsonutils.NewString(fmt.Sprintf("%s://%s:%d",
-		schema, masterIp, options.HostOptions.Port)))
-	content.Set("cpu_count", jsonutils.NewInt(int64(h.Cpu.cpuInfoProc.Count)))
+	input.ManagerUri = fmt.Sprintf("%s://%s:%d", schema, masterIp, options.HostOptions.Port)
+	input.CpuCount = &h.Cpu.cpuInfoProc.Count
+	nodeCount := int8(h.Cpu.cpuInfoDmi.Nodes)
 	if sysutils.IsHypervisor() {
-		content.Set("node_count", jsonutils.NewInt(1))
-	} else {
-		content.Set("node_count", jsonutils.NewInt(int64(h.Cpu.cpuInfoDmi.Nodes)))
+		nodeCount = 1
 	}
-	content.Set("cpu_desc", jsonutils.NewString(h.Cpu.cpuInfoProc.Model))
-	content.Set("cpu_microcode", jsonutils.NewString(h.Cpu.cpuInfoProc.Microcode))
-	content.Set("cpu_architecture", jsonutils.NewString(h.Cpu.CpuArchitecture))
+	input.NodeCount = &nodeCount
+	input.CpuDesc = h.Cpu.cpuInfoProc.Model
+	input.CpuMicrocode = h.Cpu.cpuInfoProc.Microcode
+	input.CpuArchitecture = h.Cpu.CpuArchitecture
+
 	if h.Cpu.cpuInfoProc.Freq > 0 {
-		content.Set("cpu_mhz", jsonutils.NewInt(int64(h.Cpu.cpuInfoProc.Freq)))
+		input.CpuMhz = &h.Cpu.cpuInfoProc.Freq
 	}
-	content.Set("cpu_cache", jsonutils.NewInt(int64(h.Cpu.cpuInfoProc.Cache)))
-	memTotal := h.GetMemory()
-	content.Set("mem_size", jsonutils.NewInt(int64(memTotal)))
+	input.CpuCache = fmt.Sprintf("%d", h.Cpu.cpuInfoProc.Cache)
+	input.MemSize = fmt.Sprintf("%d", h.GetMemory())
 	if len(hostId) == 0 {
 		// first time create
-		content.Set("mem_reserved", jsonutils.NewInt(int64(h.getReservedMemMb())))
+		input.MemReserved = fmt.Sprintf("%d", h.getReservedMemMb())
 	}
-	content.Set("storage_driver", jsonutils.NewString(api.DISK_DRIVER_LINUX))
-	content.Set("storage_type", jsonutils.NewString(h.sysinfo.StorageType))
-	content.Set("storage_size", jsonutils.NewInt(int64(storageman.GetManager().GetTotalCapacity())))
+	input.StorageDriver = api.DISK_DRIVER_LINUX
+	input.StorageType = h.sysinfo.StorageType
+	storageSize := storageman.GetManager().GetTotalCapacity()
+	input.StorageSize = &storageSize
 
 	// TODO optimize content data struct
-	content.Set("sys_info", jsonutils.Marshal(h.getSysInfo()))
-	content.Set("sn", jsonutils.NewString(h.sysinfo.SN))
-	content.Set("host_type", jsonutils.NewString(options.HostOptions.HostType))
+	input.SysInfo = jsonutils.Marshal(h.getSysInfo())
+	input.SN = h.sysinfo.SN
+	input.HostType = options.HostOptions.HostType
 	if len(options.HostOptions.Rack) > 0 {
-		content.Set("rack", jsonutils.NewString(options.HostOptions.Rack))
+		input.Rack = options.HostOptions.Rack
 	}
 	if len(options.HostOptions.Slots) > 0 {
-		content.Set("slots", jsonutils.NewString(options.HostOptions.Slots))
+		input.Slots = options.HostOptions.Slots
 	}
-	content.Set("__meta__", jsonutils.Marshal(h.getSysInfo()))
-	content.Set("version", jsonutils.NewString(version.GetShortString()))
-	content.Set("ovn_version", jsonutils.NewString(MustGetOvnVersion()))
+	meta, _ := jsonutils.Marshal(h.getSysInfo()).GetMap()
+	input.Metadata = map[string]string{}
+	for k, v := range meta {
+		input.Metadata[k] = v.String()
+	}
+	input.Version = version.GetShortString()
+	input.OvnVersion = MustGetOvnVersion()
 
 	var (
 		res jsonutils.JSONObject
 		err error
 	)
 	if !h.isInit {
-		res, err = modules.Hosts.Update(h.GetSession(), hostId, content)
+		res, err = modules.Hosts.Update(h.GetSession(), hostId, jsonutils.Marshal(input))
 	} else {
-		res, err = modules.Hosts.CreateInContext(h.GetSession(), content, &modules.Zones, h.ZoneId)
+		res, err = modules.Hosts.CreateInContext(h.GetSession(), jsonutils.Marshal(input), &modules.Zones, h.ZoneId)
 	}
 	if err != nil {
-		h.onFail(err)
+		h.onFail(errors.Wrapf(err, "host create or update with %s", jsonutils.Marshal(input)))
 		return
-	} else {
-		h.onUpdateHostInfoSucc(res)
 	}
+	h.onUpdateHostInfoSucc(res)
 }
 
 func (h *SHostInfo) updateHostMetadata(hostname string) error {
@@ -1155,12 +1192,12 @@ func (h *SHostInfo) updateHostMetadata(hostname string) error {
 	return err
 }
 
-func (h *SHostInfo) SyncRootPartitionUsedCapacity() error {
-	data := jsonutils.NewDict()
-	data.Set("root_partition_used_capacity_mb", jsonutils.NewInt(int64(storageman.GetRootPartUsedCapacity())))
-	_, err := modules.Hosts.SetMetadata(h.GetSession(), h.HostId, data)
-	return err
-}
+// func (h *SHostInfo) SyncRootPartitionUsedCapacity() error {
+//	data := jsonutils.NewDict()
+//	data.Set("root_partition_used_capacity_mb", jsonutils.NewInt(int64(storageman.GetRootPartUsedCapacity())))
+//	_, err := modules.Hosts.SetMetadata(h.GetSession(), h.HostId, data)
+//	return err
+// }
 
 func (h *SHostInfo) onUpdateHostInfoSucc(hostbody jsonutils.JSONObject) {
 	h.HostId, _ = hostbody.GetString("id")
@@ -1183,9 +1220,9 @@ func (h *SHostInfo) onUpdateHostInfoSucc(hostbody jsonutils.JSONObject) {
 	reserved := h.getReportedReservedMemMb()
 	if reserved != int(memReservedMb) {
 		h.updateHostReservedMem(reserved)
-	} else {
-		h.PutHostOffline("")
+		return
 	}
+	h.getNetworkInfo()
 }
 
 func (h *SHostInfo) updateHostReservedMem(reserved int) {
@@ -1237,24 +1274,6 @@ func (h *SHostInfo) getReportedReservedMemMb() int {
 	return h.getReservedMemMb()
 }
 
-func (h *SHostInfo) PutHostOffline(reason string) {
-	data := jsonutils.NewDict()
-	if options.HostOptions.EnableHealthChecker {
-		data.Set("update_health_status", jsonutils.JSONTrue)
-	}
-	if len(reason) > 0 {
-		data.Set("reason", jsonutils.NewString(reason))
-	}
-	_, err := modules.Hosts.PerformAction(
-		h.GetSession(), h.HostId, "offline", data)
-	if err != nil {
-		h.onFail(err)
-		return
-	} else {
-		h.getNetworkInfo()
-	}
-}
-
 func (h *SHostInfo) PutHostOnline() error {
 	if len(h.SysError) > 0 && !options.HostOptions.StartHostIgnoreSysError {
 		log.Fatalf("Can't put host online, unless resolve these problem %v", h.SysError)
@@ -1262,11 +1281,11 @@ func (h *SHostInfo) PutHostOnline() error {
 		log.Errorf("Host sys error: %v", h.SysError)
 	}
 
+	data := jsonutils.NewDict()
 	if len(h.SysWarning) > 0 {
-		log.Warningf("Host have some hidden problem %v", h.SysWarning)
+		data.Set("warning", jsonutils.Marshal(h.SysWarning))
 	}
 
-	data := jsonutils.NewDict()
 	if options.HostOptions.EnableHealthChecker && len(options.HostOptions.EtcdEndpoints) > 0 {
 		_, err := host_health.InitHostHealthManager(h.HostId, h.onHostDown)
 		if err != nil {
@@ -1277,6 +1296,9 @@ func (h *SHostInfo) PutHostOnline() error {
 
 	_, err := modules.Hosts.PerformAction(
 		h.GetSession(), h.HostId, "online", data)
+	if err != nil {
+		logclient.AddSimpleActionLog(h, logclient.ACT_ONLINE, data, hostutils.GetComputeSession(context.Background()).GetToken(), false)
+	}
 	return err
 }
 
@@ -1289,28 +1311,23 @@ func (h *SHostInfo) getNetworkInfo() {
 		h.GetSession(),
 		h.HostId, params)
 	if err != nil {
-		h.onFail(err)
+		h.onFail(errors.Wrapf(err, "Hostwires.ListDescendent: %s", params))
 		return
-	} else {
-		for _, hostwire := range res.Data {
-			bridge, _ := hostwire.GetString("bridge")
-			iface, _ := hostwire.GetString("interface")
-			macAddr, _ := hostwire.GetString("mac_addr")
-			nic := h.GetMatchNic(bridge, iface, macAddr)
-			if nic != nil {
-				wire, _ := hostwire.GetString("wire")
-				wireId, _ := hostwire.GetString("wire_id")
-				bandwidth, err := hostwire.Int("bandwidth")
-				if err != nil {
-					bandwidth = 1000
-				}
-				nic.SetWireId(wire, wireId, bandwidth)
-			} else {
-				log.Warningf("NIC not present %s", hostwire.String())
-			}
-		}
-		h.uploadNetworkInfo()
 	}
+	hostwires := []api.HostwireDetails{}
+	jsonutils.Update(&hostwires, res.Data)
+	for _, hw := range hostwires {
+		nic := h.GetMatchNic(hw.Bridge, hw.Interface, hw.MacAddr)
+		if nic != nil {
+			if hw.Bandwidth < 1 {
+				hw.Bandwidth = 1000
+			}
+			nic.SetWireId(hw.Wire, hw.WireId, int64(hw.Bandwidth))
+		} else {
+			log.Warningf("NIC not present %s", jsonutils.Marshal(hw).String())
+		}
+	}
+	h.uploadNetworkInfo()
 }
 
 func (h *SHostInfo) uploadNetworkInfo() {
@@ -1540,9 +1557,9 @@ func (h *SHostInfo) uploadStorageInfo() {
 			h.onSyncStorageInfoSucc(s, res)
 		}
 	}
-	go storageman.StartSyncStorageSizeTask(
-		time.Duration(options.HostOptions.SyncStorageInfoDurationSecond) * time.Second,
-	)
+	// go storageman.StartSyncStorageSizeTask(
+	//	time.Duration(options.HostOptions.SyncStorageInfoDurationSecond) * time.Second,
+	// )
 	h.probeSyncIsolatedDevicesStep()
 }
 
@@ -1750,6 +1767,18 @@ func (h *SHostInfo) registerHostlocalServer() error {
 	return nil
 }
 
+func (h *SHostInfo) GetId() string {
+	return h.HostId
+}
+
+func (h *SHostInfo) GetName() string {
+	return h.getHostname()
+}
+
+func (h *SHostInfo) Keyword() string {
+	return "host"
+}
+
 func (h *SHostInfo) stop() {
 	log.Infof("Host Info stop ...")
 	h.unregister()
@@ -1762,15 +1791,23 @@ func (h *SHostInfo) stop() {
 }
 
 func (h *SHostInfo) unregister() {
+	isLog := false
 	for {
 		_, err := modules.Hosts.PerformAction(
-			h.GetSession(), h.HostId, "offline", nil)
+			h.GetSession(), h.HostId, "offline", jsonutils.Marshal(map[string]string{"reason": "host stop"}))
 		if err != nil {
-			log.Errorf("put host offline failed: %s", err)
+			if errors.Cause(err) == httperrors.ErrResourceNotFound {
+				log.Errorf("host not found on region, may be removed, exit cleanly")
+				break
+			}
+			if !isLog {
+				logclient.AddSimpleActionLog(h, logclient.ACT_OFFLINE, err, hostutils.GetComputeSession(context.Background()).GetToken(), false)
+				isLog = true
+			}
 			time.Sleep(time.Second * 1)
-		} else {
-			break
+			continue
 		}
+		break
 	}
 	h.stopped = true
 }

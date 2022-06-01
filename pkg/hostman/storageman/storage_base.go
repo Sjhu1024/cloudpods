@@ -29,6 +29,8 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/onecloud/pkg/apis"
+	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/apis/host"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
@@ -85,11 +87,11 @@ func NewStorage(manager *SStorageManager, mountPoint, storageType string) IStora
 type IStorage interface {
 	GetId() string
 	GetStorageName() string
-	GetZoneName() string
+	GetZoneId() string
 
 	SetStorageInfo(storageId, storageName string, conf jsonutils.JSONObject) error
 	SyncStorageInfo() (jsonutils.JSONObject, error)
-	SyncStorageSize() error
+	SyncStorageSize() (api.SHostStorageStat, error)
 	StorageType() string
 	GetStorageConf() *jsonutils.JSONDict
 	GetStoragecacheId() string
@@ -131,7 +133,7 @@ type IStorage interface {
 
 	CreateSnapshotFormUrl(ctx context.Context, snapshotUrl, diskId, snapshotPath string) error
 
-	DeleteDiskfile(diskPath string) error
+	DeleteDiskfile(diskPath string, skipRecycle bool) error
 	GetFuseTmpPath() string
 	GetFuseMountPath() string
 	GetImgsaveBackupPath() string
@@ -205,8 +207,8 @@ func (s *SBaseStorage) SetPath(p string) {
 	s.Path = p
 }
 
-func (s *SBaseStorage) GetZoneName() string {
-	return s.Manager.GetZoneName()
+func (s *SBaseStorage) GetZoneId() string {
+	return s.Manager.GetZoneId()
 }
 
 func (s *SBaseStorage) GetCapacity() int {
@@ -271,8 +273,13 @@ func (s *SBaseStorage) SetStorageInfo(storageId, storageName string, conf jsonut
 	return nil
 }
 
-func (s *SBaseStorage) SyncStorageSize() error {
-	return fmt.Errorf("not ipmlement")
+func (s *SBaseStorage) SyncStorageSize() (api.SHostStorageStat, error) {
+	stat := api.SHostStorageStat{
+		StorageId: s.StorageId,
+	}
+	stat.CapacityMb = int64(s.GetCapacity())
+	stat.ActualCapacityUsedMb = int64(s.GetUsedSizeMb())
+	return stat, nil
 }
 
 func (s *SBaseStorage) bindMountTo(sPath string) error {
@@ -313,7 +320,7 @@ func (s *SBaseStorage) RemoveDisk(d IDisk) {
 	}
 }
 
-func (s *SBaseStorage) DeleteDiskfile(diskpath string) error {
+func (s *SBaseStorage) DeleteDiskfile(diskpath string, skipRecycle bool) error {
 	return fmt.Errorf("Not Implement")
 }
 
@@ -356,7 +363,11 @@ func (s *SBaseStorage) CreateDiskByDiskinfo(ctx context.Context, params interfac
 }
 
 func (s *SBaseStorage) CreateRawDisk(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
-	return disk.CreateRaw(ctx, input.DiskInfo.DiskSizeMb, input.DiskInfo.Format, input.DiskInfo.FsFormat, input.DiskInfo.Encryption, input.DiskId, "")
+	var encryptInfo *apis.SEncryptInfo
+	if input.DiskInfo.Encryption {
+		encryptInfo = &input.DiskInfo.EncryptInfo
+	}
+	return disk.CreateRaw(ctx, input.DiskInfo.DiskSizeMb, input.DiskInfo.Format, input.DiskInfo.FsFormat, encryptInfo, input.DiskId, "")
 }
 
 func (s *SBaseStorage) CreateDiskFromTemplate(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
@@ -364,7 +375,12 @@ func (s *SBaseStorage) CreateDiskFromTemplate(ctx context.Context, disk IDisk, i
 		format = "qcow2" // force qcow2
 	)
 
-	return disk.CreateFromTemplate(ctx, input.DiskInfo.ImageId, format, int64(input.DiskInfo.DiskSizeMb))
+	var encryptInfo *apis.SEncryptInfo
+	if input.DiskInfo.Encryption {
+		encryptInfo = &input.DiskInfo.EncryptInfo
+	}
+
+	return disk.CreateFromTemplate(ctx, input.DiskInfo.ImageId, format, int64(input.DiskInfo.DiskSizeMb), encryptInfo)
 }
 
 func (s *SBaseStorage) CreateDiskFromSnpashot(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
@@ -419,8 +435,8 @@ func (s *SBaseStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, inp
 	backupPath := path.Join(s.GetBackupDir(), info.Backup.BackupId)
 	img, err := qemuimg.NewQemuImage(backupPath)
 	if err != nil {
-		log.Errorln("unable to new qemu image for %s: %s", backupPath, err.Error())
-		return err
+		log.Errorf("unable to new qemu image for %s: %s", backupPath, err.Error())
+		return errors.Wrapf(err, "unable to new qemu image for %s", backupPath)
 	}
 	_, err = img.Clone(disk.GetPath(), qemuimg.QCOW2, false)
 	return err
@@ -533,7 +549,7 @@ func requestConvertSnapshot(storage IStorage, snapshotPath, diskId string) {
 		return
 	}
 	log.Infof("convertSnapshot path %s", convertSnapshotPath)
-	err = img.Convert2Qcow2To(outfile, true)
+	err = img.Convert2Qcow2To(outfile, true, "", "", "")
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -566,7 +582,7 @@ func requestDeleteSnapshot(
 		return
 	}
 	if !pendingDelete {
-		if err := storage.DeleteDiskfile(deleteSnapshotPath); err != nil {
+		if err := storage.DeleteDiskfile(deleteSnapshotPath, false); err != nil {
 			log.Errorln(err)
 			return
 		}

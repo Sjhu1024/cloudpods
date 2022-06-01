@@ -217,7 +217,7 @@ func (self *ManagedGuestCreateDiskTask) OnManagedDiskPrepared(ctx context.Contex
 			return
 		}
 
-		iVM, e := guest.GetIVM()
+		iVM, e := guest.GetIVM(ctx)
 		if e != nil {
 			self.SetStageFailed(ctx, jsonutils.NewString(fmt.Sprintf("iVM not found: %s", e)))
 			return
@@ -276,7 +276,7 @@ func (self *ESXiGuestCreateDiskTask) OnInit(ctx context.Context, obj db.IStandal
 			self.SetStageFailed(ctx, jsonutils.NewString(fmt.Sprintf("Disk %s already created??(status=%s)", diskId, disk.Status)))
 			return
 		}
-		ivm, err := guest.GetIVM()
+		ivm, err := guest.GetIVM(ctx)
 		if err != nil {
 			self.SetStageFailed(ctx, jsonutils.NewString(fmt.Sprintf("fail to find iVM for %s, error: %v", guest.GetName(), err)))
 			return
@@ -285,10 +285,16 @@ func (self *ESXiGuestCreateDiskTask) OnInit(ctx context.Context, obj db.IStandal
 			osProf := guest.GetOSProfile()
 			d.Driver = osProf.DiskDriver
 		}
+		storage, err := disk.GetStorage()
+		if err != nil {
+			self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
+			return
+		}
 		opts := cloudprovider.GuestDiskCreateOptions{
-			SizeMb: disk.DiskSize,
-			UUID:   disk.Id,
-			Driver: d.Driver,
+			SizeMb:    disk.DiskSize,
+			UUID:      disk.Id,
+			Driver:    d.Driver,
+			StorageId: storage.GetExternalId(),
 		}
 		_, err = ivm.CreateDisk(ctx, &opts)
 		if err != nil {
@@ -323,7 +329,6 @@ func (self *ESXiGuestCreateDiskTask) OnInit(ctx context.Context, obj db.IStandal
 		}
 
 		disk.SetStatus(self.UserCred, api.DISK_READY, "create disk success")
-		storage, _ := disk.GetStorage()
 		storage.ClearSchedDescCache()
 		db.OpsLog.LogEvent(disk, db.ACT_ALLOCATE, disk.GetShortDesc(ctx), self.UserCred)
 		db.OpsLog.LogAttachEvent(ctx, guest, disk, self.UserCred, disk.GetShortDesc(ctx))
@@ -372,7 +377,7 @@ func (self *NutanixGuestCreateDiskTask) taskFailed(ctx context.Context, err erro
 func (self *NutanixGuestCreateDiskTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
 
-	ivm, err := guest.GetIVM()
+	ivm, err := guest.GetIVM(ctx)
 	if err != nil {
 		self.taskFailed(ctx, errors.Wrapf(err, "guest.GetIVM"))
 		return

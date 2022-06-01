@@ -43,6 +43,15 @@ func (opts *DiskBackupIdOptions) Params() (jsonutils.JSONObject, error) {
 	return nil, nil
 }
 
+type DiskBackupDeleteOptions struct {
+	DiskBackupIdOptions
+	Force bool `help:"force delete"`
+}
+
+func (opts *DiskBackupDeleteOptions) QueryParams() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
 type DiskBackupCreateOptions struct {
 	options.BaseCreateOptions
 	DISKID          string `help:"disk id" json:"disk_id"`
@@ -121,7 +130,7 @@ func (opts *InstanceBackupListOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type InstanceBackupIdOptions struct {
-	ID string `help:"instance backup id"`
+	ID string `help:"instance backup id" json:"-"`
 }
 
 func (opts *InstanceBackupIdOptions) GetId() string {
@@ -130,6 +139,15 @@ func (opts *InstanceBackupIdOptions) GetId() string {
 
 func (opts *InstanceBackupIdOptions) Params() (jsonutils.JSONObject, error) {
 	return nil, nil
+}
+
+type InstanceBackupDeleteOptions struct {
+	InstanceBackupIdOptions
+	Force bool `help:"force delete"`
+}
+
+func (opts *InstanceBackupDeleteOptions) QueryParams() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
 }
 
 type InstanceBackupRecoveryOptions struct {
@@ -142,5 +160,25 @@ func (opts *InstanceBackupRecoveryOptions) GetId() string {
 }
 
 func (opts *InstanceBackupRecoveryOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
+type InstanceBackupPackOptions struct {
+	DiskBackupIdOptions
+	PackageName string `help:"package name" json:"package_name"`
+}
+
+func (opts *InstanceBackupPackOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
+type InstanceBackupManagerCreateFromPackageOptions struct {
+	PackageName     string `help:"package name" json:"package_name"`
+	Name            string `help:"instance backup name" json:"name"`
+	BackupStorageId string `help:"backup storage id" json:"backup_storage_id"`
+	ProjectId       string `help:"target project id" json:"project_id"`
+}
+
+func (opts *InstanceBackupManagerCreateFromPackageOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(opts), nil
 }

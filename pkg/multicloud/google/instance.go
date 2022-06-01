@@ -32,7 +32,9 @@ import (
 	"yunion.io/x/onecloud/pkg/multicloud"
 	"yunion.io/x/onecloud/pkg/util/billing"
 	"yunion.io/x/onecloud/pkg/util/cloudinit"
+	"yunion.io/x/onecloud/pkg/util/encode"
 	"yunion.io/x/onecloud/pkg/util/imagetools"
+	"yunion.io/x/onecloud/pkg/util/pinyinutils"
 )
 
 const (
@@ -635,10 +637,15 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 	if len(desc.SysDisk.Name) == 0 {
 		desc.SysDisk.Name = fmt.Sprintf("vdisk-%s-%d", desc.Name, time.Now().UnixNano())
 	}
+	nameConv := func(name string) string {
+		name = strings.Replace(name, "_", "-", -1)
+		name = pinyinutils.Text2Pinyin(name)
+		return strings.ToLower(name)
+	}
 	disks = append(disks, map[string]interface{}{
 		"boot": true,
 		"initializeParams": map[string]interface{}{
-			"diskName":    strings.Replace(desc.SysDisk.Name, "_", "-", -1),
+			"diskName":    nameConv(desc.SysDisk.Name),
 			"sourceImage": desc.ExternalImageId,
 			"diskSizeGb":  desc.SysDisk.SizeGB,
 			"diskType":    fmt.Sprintf("zones/%s/diskTypes/%s", zone, desc.SysDisk.StorageType),
@@ -652,7 +659,7 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 		disks = append(disks, map[string]interface{}{
 			"boot": false,
 			"initializeParams": map[string]interface{}{
-				"diskName":   strings.Replace(disk.Name, "_", "-", -1),
+				"diskName":   nameConv(disk.Name),
 				"diskSizeGb": disk.SizeGB,
 				"diskType":   fmt.Sprintf("zones/%s/diskTypes/%s", zone, disk.StorageType),
 			},
@@ -676,8 +683,13 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 		"disks": disks,
 	}
 
-	if len(desc.Tags) > 0 {
-		params["labels"] = desc.Tags
+	labels := map[string]string{}
+	for k, v := range desc.Tags {
+		labels[encode.EncodeGoogleLabel(k)] = encode.EncodeGoogleLabel(v)
+	}
+
+	if len(labels) > 0 {
+		params["labels"] = labels
 	}
 
 	if tags, ok := secgroups[SECGROUP_TYPE_TAG]; ok && len(tags) > 0 {
@@ -925,7 +937,11 @@ func (self *SInstance) SaveImage(opts *cloudprovider.SaveImageOptions) (cloudpro
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "no valid system disk found")
 }
 
-func (region *SRegion) SetLabels(id string, labels map[string]string, labelFingerprint string) error {
+func (region *SRegion) SetLabels(id string, _labels map[string]string, labelFingerprint string) error {
+	labels := map[string]string{}
+	for k, v := range _labels {
+		labels[encode.EncodeGoogleLabel(k)] = encode.EncodeGoogleLabel(v)
+	}
 	params := map[string]interface{}{
 		"labels":           labels,
 		"labelFingerprint": labelFingerprint,
@@ -939,7 +955,8 @@ func (region *SRegion) SetLabels(id string, labels map[string]string, labelFinge
 
 func (self *SInstance) SetTags(tags map[string]string, replace bool) error {
 	if !replace {
-		for k, v := range self.Labels {
+		oldTags, _ := self.GetTags()
+		for k, v := range oldTags {
 			if _, ok := tags[k]; !ok {
 				tags[k] = v
 			}

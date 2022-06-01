@@ -63,6 +63,7 @@ type SIdentityBaseResource struct {
 	db.SStandaloneResourceBase
 	db.SDomainizedResourceBase
 
+	// 额外信息
 	Extra *jsonutils.JSONDict `nullable:"true"`
 	// DomainId string `width:"64" charset:"ascii" default:"default" nullable:"false" index:"true" list:"user"`
 }
@@ -81,7 +82,7 @@ func NewEnabledIdentityBaseResourceManager(dt interface{}, tableName string, key
 type SEnabledIdentityBaseResource struct {
 	SIdentityBaseResource
 
-	Enabled tristate.TriState `nullable:"false" default:"true" list:"user" update:"domain" create:"domain_optional"`
+	Enabled tristate.TriState `default:"true" list:"user" update:"domain" create:"domain_optional"`
 }
 
 func (model *SIdentityBaseResource) GetIIdentityModelManager() IIdentityModelManager {

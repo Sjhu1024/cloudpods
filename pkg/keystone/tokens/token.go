@@ -162,14 +162,14 @@ func (t *SAuthToken) Encode() ([]byte, error) {
 func (t *SAuthToken) ParseFernetToken(tokenStr string) error {
 	tk := keys.TokenKeysManager.Decrypt([]byte(tokenStr)) // , time.Duration(options.Options.TokenExpirationSeconds)*time.Second)
 	if tk == nil {
-		return ErrExpiredToken
+		return errors.Wrapf(ErrInvalidToken, tokenStr)
 	}
 	err := t.Decode(tk)
 	if err != nil {
 		return errors.Wrap(err, "decode error")
 	}
 	if t.ExpiresAt.Before(time.Now()) {
-		return ErrExpiredToken
+		return errors.Wrapf(ErrExpiredToken, "expires_at %s", t.ExpiresAt.String())
 	}
 	return nil
 }
@@ -339,7 +339,7 @@ func (t *SAuthToken) getTokenV3(
 			token.Token.Roles[i].Name = roles[i].Name
 		}
 
-		policyNames, _, _ := models.RolePolicyManager.GetMatchPolicyGroup(&token, true)
+		policyNames, _, _ := models.RolePolicyManager.GetMatchPolicyGroup(&token, time.Time{}, true)
 		token.Token.Policies.Project, _ = policyNames[rbacutils.ScopeProject]
 		token.Token.Policies.Domain, _ = policyNames[rbacutils.ScopeDomain]
 		token.Token.Policies.System, _ = policyNames[rbacutils.ScopeSystem]

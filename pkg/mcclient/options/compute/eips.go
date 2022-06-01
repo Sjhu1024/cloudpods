@@ -24,7 +24,7 @@ type ElasticipListOptions struct {
 	Region string `help:"List eips in cloudregion"`
 
 	Usable                    *bool  `help:"List all zones that is usable"`
-	UsableEipForAssociateType string `help:"With associate id filter which eip can associate" choices:"server|natgateway"`
+	UsableEipForAssociateType string `help:"With associate id filter which eip can associate" choices:"server|natgateway|loadbalancer"`
 	UsableEipForAssociateId   string `help:"With associate type filter which eip can associate"`
 
 	options.BaseListOptions
@@ -53,6 +53,9 @@ type EipUpdateOptions struct {
 	options.BaseUpdateOptions
 
 	AutoDellocate *string `help:"enable or disable automatically dellocate when dissociate from instance" choices:"true|false"`
+	IpAddr        string
+	AssociateId   string
+	AssociateType string
 }
 
 func (opts *EipUpdateOptions) Params() (jsonutils.JSONObject, error) {
@@ -62,7 +65,7 @@ func (opts *EipUpdateOptions) Params() (jsonutils.JSONObject, error) {
 type EipAssociateOptions struct {
 	options.BaseIdOptions
 	INSTANCE_ID  string `help:"ID of instance the eip associated with"`
-	InstanceType string `default:"server" help:"Instance type that the eip associated with, default is server" choices:"server|natgateway"`
+	InstanceType string `default:"server" help:"Instance type that the eip associated with, default is server" choices:"server|natgateway|loadbalancer"`
 }
 
 func (opts *EipAssociateOptions) Params() (jsonutils.JSONObject, error) {

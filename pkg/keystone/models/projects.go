@@ -77,9 +77,11 @@ func init() {
 type SProject struct {
 	SIdentityBaseResource
 
+	// 上级项目或域的ID
 	ParentId string `width:"64" charset:"ascii" list:"domain" create:"domain_optional"`
 
-	IsDomain tristate.TriState `default:"false" nullable:"false"`
+	// 该项目是否为域（domain）
+	IsDomain tristate.TriState `default:"false"`
 }
 
 func (manager *SProjectManager) GetContextManagers() [][]db.IModelManager {
@@ -439,6 +441,9 @@ func (manager *SProjectManager) FetchUserProjects(userId string) ([]SProjectExte
 	if err != nil && err != sql.ErrNoRows {
 		return nil, errors.Wrap(err, "query.All")
 	}
+	for i := range ret {
+		ret[i].SetModelManager(manager, &ret[i])
+	}
 	return ret, nil
 }
 
@@ -478,8 +483,11 @@ func (self *SProject) PostCreate(
 }
 
 func validateJoinProject(userCred mcclient.TokenCredential, project *SProject, roleIds []string) error {
-	_, opsPolicies, _ := RolePolicyManager.GetMatchPolicyGroup(userCred, false)
-	_, assignPolicies, _ := RolePolicyManager.GetMatchPolicyGroup2(false, roleIds, project.Id, "", false)
+	if options.Options.NoPolicyViolationCheck {
+		return nil
+	}
+	_, opsPolicies, _ := RolePolicyManager.GetMatchPolicyGroup(userCred, time.Time{}, false)
+	_, assignPolicies, _ := RolePolicyManager.GetMatchPolicyGroup2(false, roleIds, project.Id, "", time.Time{}, false)
 	opsScope := opsPolicies.HighestScope()
 	assignScope := assignPolicies.HighestScope()
 	if assignScope.HigherThan(opsScope) {

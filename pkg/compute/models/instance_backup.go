@@ -17,6 +17,8 @@ package models
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -25,11 +27,13 @@ import (
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
-	schedapi "yunion.io/x/onecloud/pkg/apis/scheduler"
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	identity_modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -52,10 +56,12 @@ type SInstanceBackup struct {
 	SCloudregionResourceBase
 	db.SMultiArchResourceBase
 
+	db.SEncryptedResource
+
 	BackupStorageId string `width:"36" charset:"ascii" nullable:"true" create:"required" list:"user" index:"true"`
 
-	GuestId string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"required" index:"true"`
-	// 云主机配置
+	GuestId string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"optional" index:"true"`
+	// 云主机配置 corresponds to api.ServerCreateInput
 	ServerConfig jsonutils.JSONObject `nullable:"true" list:"user"`
 	// 云主机标签
 	ServerMetadata jsonutils.JSONObject `nullable:"true" list:"user"`
@@ -76,6 +82,7 @@ type SInstanceBackupManager struct {
 	SManagedResourceBaseManager
 	SCloudregionResourceBaseManager
 	db.SMultiArchResourceBaseManager
+	db.SEncryptedResourceManager
 }
 
 var InstanceBackupManager *SInstanceBackupManager
@@ -196,6 +203,20 @@ func (self *SInstanceBackup) getMoreDetails(userCred mcclient.TokenCredential, o
 	if backupStorage != nil {
 		out.BackupStorageName = backupStorage.GetName()
 	}
+	backups, _ := self.GetBackups()
+	out.DiskBackups = []api.SSimpleBackup{}
+	for i := 0; i < len(backups); i++ {
+		out.DiskBackups = append(out.DiskBackups, api.SSimpleBackup{
+			Id:           backups[i].Id,
+			Name:         backups[i].Name,
+			SizeMb:       backups[i].SizeMb,
+			DiskSizeMb:   backups[i].DiskSizeMb,
+			DiskType:     backups[i].DiskType,
+			Status:       backups[i].Status,
+			EncryptKeyId: backups[i].EncryptKeyId,
+			CreatedAt:    backups[i].CreatedAt,
+		})
+	}
 	return out
 }
 
@@ -211,11 +232,14 @@ func (manager *SInstanceBackupManager) FetchCustomizeColumns(
 
 	virtRows := manager.SVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	manRows := manager.SManagedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	encRows := manager.SEncryptedResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 
 	for i := range rows {
 		rows[i] = api.InstanceBackupDetails{
 			VirtualResourceDetails: virtRows[i],
 			ManagedResourceInfo:    manRows[i],
+
+			EncryptedResourceDetails: encRows[i],
 		}
 		rows[i] = objs[i].(*SInstanceBackup).getMoreDetails(userCred, rows[i])
 	}
@@ -238,22 +262,24 @@ func (manager *SInstanceBackupManager) fillInstanceBackup(ctx context.Context, u
 	instanceBackup.ProjectId = guest.ProjectId
 	instanceBackup.DomainId = guest.DomainId
 	instanceBackup.GuestId = guest.Id
-	guestSchedInput := guest.ToSchedDesc()
+
+	// inherit encrypt_key_id from guest
+	instanceBackup.EncryptKeyId = guest.EncryptKeyId
 
 	host, _ := guest.GetHost()
 	instanceBackup.ManagerId = host.ManagerId
 	zone, _ := host.GetZone()
 	instanceBackup.CloudregionId = zone.CloudregionId
 
-	guestSchedInput.HostId = ""
-	guestSchedInput.Project = ""
-	guestSchedInput.Domain = ""
-	for i := 0; i < len(guestSchedInput.Networks); i++ {
-		guestSchedInput.Networks[i].Mac = ""
-		guestSchedInput.Networks[i].Address = ""
-		guestSchedInput.Networks[i].Address6 = ""
+	createInput := guest.ToCreateInput(ctx, userCred)
+	createInput.ProjectId = guest.ProjectId
+	createInput.ProjectDomainId = guest.DomainId
+	for i := 0; i < len(createInput.Networks); i++ {
+		createInput.Networks[i].Mac = ""
+		createInput.Networks[i].Address = ""
+		createInput.Networks[i].Address6 = ""
 	}
-	instanceBackup.ServerConfig = jsonutils.Marshal(guestSchedInput.ServerConfig)
+	instanceBackup.ServerConfig = jsonutils.Marshal(createInput)
 	if len(guest.KeypairId) > 0 {
 		instanceBackup.KeypairId = guest.KeypairId
 	}
@@ -314,8 +340,9 @@ func (manager *SInstanceBackupManager) CreateInstanceBackup(ctx context.Context,
 
 func (self *SInstanceBackup) ToInstanceCreateInput(sourceInput *api.ServerCreateInput) (*api.ServerCreateInput, error) {
 
-	serverConfig := new(schedapi.ServerConfig)
-	if err := self.ServerConfig.Unmarshal(serverConfig); err != nil {
+	createInput := new(api.ServerCreateInput)
+	createInput.ServerConfigs = new(api.ServerConfigs)
+	if err := self.ServerConfig.Unmarshal(createInput); err != nil {
 		return nil, errors.Wrap(err, "unmarshal sched input")
 	}
 
@@ -325,21 +352,24 @@ func (self *SInstanceBackup) ToInstanceCreateInput(sourceInput *api.ServerCreate
 		return nil, errors.Wrap(err, "fetch instance backups")
 	}
 
-	for i := 0; i < len(serverConfig.Disks); i++ {
-		index := serverConfig.Disks[i].Index
+	for i := 0; i < len(createInput.Disks); i++ {
+		index := createInput.Disks[i].Index
 		if index < len(isjs) {
-			serverConfig.Disks[i].BackupId = isjs[index].DiskBackupId
-			serverConfig.Disks[i].ImageId = ""
-			serverConfig.Disks[i].SnapshotId = ""
+			createInput.Disks[i].BackupId = isjs[index].DiskBackupId
+			createInput.Disks[i].ImageId = ""
+			createInput.Disks[i].SnapshotId = ""
 		}
 	}
 
-	sourceInput.Disks = serverConfig.Disks
+	sourceInput.Disks = createInput.Disks
 	if sourceInput.VmemSize == 0 {
-		sourceInput.VmemSize = serverConfig.Memory
+		sourceInput.VmemSize = createInput.VmemSize
 	}
 	if sourceInput.VcpuCount == 0 {
-		sourceInput.VcpuCount = serverConfig.Ncpu
+		sourceInput.VcpuCount = createInput.VcpuCount
+	}
+	if len(sourceInput.OsArch) == 0 {
+		sourceInput.OsArch = createInput.OsArch
 	}
 	if len(self.KeypairId) > 0 {
 		sourceInput.KeypairId = self.KeypairId
@@ -359,7 +389,34 @@ func (self *SInstanceBackup) ToInstanceCreateInput(sourceInput *api.ServerCreate
 	sourceInput.OsType = self.OsType
 	sourceInput.InstanceType = self.InstanceType
 	if len(sourceInput.Networks) == 0 {
-		sourceInput.Networks = serverConfig.Networks
+		sourceInput.Networks = createInput.Networks
+	}
+	if sourceInput.Vga == "" {
+		sourceInput.Vga = createInput.Vga
+	}
+	if sourceInput.Vdi == "" {
+		sourceInput.Vdi = createInput.Vdi
+	}
+	if sourceInput.Vdi == "" {
+		sourceInput.Vdi = createInput.Vdi
+	}
+	if sourceInput.Bios == "" {
+		sourceInput.Bios = createInput.Bios
+	}
+	if sourceInput.BootOrder == "" {
+		sourceInput.BootOrder = createInput.BootOrder
+	}
+	if sourceInput.ShutdownBehavior == "" {
+		sourceInput.ShutdownBehavior = createInput.ShutdownBehavior
+	}
+	if sourceInput.IsolatedDevices == nil {
+		sourceInput.IsolatedDevices = createInput.IsolatedDevices
+	}
+	if self.IsEncrypted() {
+		if sourceInput.EncryptKeyId != nil && *sourceInput.EncryptKeyId != self.EncryptKeyId {
+			return nil, errors.Wrap(httperrors.ErrConflict, "encrypt_key_id conflict with instance_backup's encrypt_key_id")
+		}
+		sourceInput.EncryptKeyId = &self.EncryptKeyId
 	}
 	return sourceInput, nil
 }
@@ -374,14 +431,17 @@ func (self *SInstanceBackup) ValidateDeleteCondition(ctx context.Context, info j
 func (self *SInstanceBackup) CustomizeDelete(
 	ctx context.Context, userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-
-	return self.StartInstanceBackupDeleteTask(ctx, userCred, "")
+	forceDelete := jsonutils.QueryBoolean(query, "force", false)
+	return self.StartInstanceBackupDeleteTask(ctx, userCred, "", forceDelete)
 }
 
 func (self *SInstanceBackup) StartInstanceBackupDeleteTask(
-	ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-
-	task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupDeleteTask", self, userCred, nil, parentTaskId, "", nil)
+	ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, forceDelete bool) error {
+	params := jsonutils.NewDict()
+	if forceDelete {
+		params.Set("force_delete", jsonutils.JSONTrue)
+	}
+	task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupDeleteTask", self, userCred, params, parentTaskId, "", nil)
 	if err != nil {
 		log.Errorf("%s", err)
 		return err
@@ -423,9 +483,8 @@ func (self *SInstanceBackup) PerformRecovery(ctx context.Context, userCred mccli
 
 func (self *SInstanceBackup) StartRecoveryTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, serverName string) error {
 	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_RECOVERY, "")
-	var params *jsonutils.JSONDict
+	params := jsonutils.NewDict()
 	if serverName != "" {
-		params = jsonutils.NewDict()
 		params.Set("server_name", jsonutils.NewString(serverName))
 	}
 	task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupRecoveryTask", self, userCred, params, parentTaskId, "", nil)
@@ -435,4 +494,178 @@ func (self *SInstanceBackup) StartRecoveryTask(ctx context.Context, userCred mcc
 		task.ScheduleRun(nil)
 	}
 	return nil
+}
+
+func (self *SInstanceBackup) PerformPack(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.InstanceBackupPackInput) (jsonutils.JSONObject, error) {
+	if input.PackageName == "" {
+		return nil, httperrors.NewMissingParameterError("miss package_name")
+	}
+	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_PACK, "")
+	params := jsonutils.NewDict()
+	params.Set("package_name", jsonutils.NewString(input.PackageName))
+	task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupPackTask", self, userCred, params, "", "", nil)
+	if err != nil {
+		return nil, err
+	} else {
+		task.ScheduleRun(nil)
+	}
+	return nil, nil
+}
+
+func (manager *SInstanceBackupManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.InstanceBackupManagerCreateFromPackageInput) (api.InstanceBackupManagerCreateFromPackageInput, error) {
+	if input.PackageName == "" {
+		return input, httperrors.NewMissingParameterError("miss package_name")
+	}
+	_, err := BackupStorageManager.FetchById(input.BackupStorageId)
+	if err != nil {
+		return input, httperrors.NewInputParameterError("unable to fetch backupStorage %s", input.BackupStorageId)
+	}
+	input.VirtualResourceCreateInput, err = manager.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
+	if err != nil {
+		return input, errors.Wrap(err, "SVirtualResourceBaseManager.ValidateCreateData")
+	}
+
+	return input, nil
+}
+
+func (manager *SInstanceBackupManager) OnCreateComplete(ctx context.Context, items []db.IModel, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
+	packageName, _ := data.GetString("package_name")
+	params := jsonutils.NewDict()
+	params.Set("package_name", jsonutils.NewString(packageName))
+	for i := range items {
+		ib := items[i].(*SInstanceBackup)
+		task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupUnpackTask", ib, userCred, params, "", "", nil)
+		if err != nil {
+			log.Errorf("InstanceBackupUnpackTask fail %s", err)
+		} else {
+			task.ScheduleRun(nil)
+		}
+	}
+}
+
+func (self *SInstanceBackup) PackMetadata(ctx context.Context, userCred mcclient.TokenCredential) (*api.InstanceBackupPackMetadata, error) {
+	allMetadata, err := self.GetAllMetadata(ctx, userCred)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetAllMetadata")
+	}
+
+	metadata := &api.InstanceBackupPackMetadata{
+		OsArch:         self.OsArch,
+		ServerConfig:   self.ServerConfig,
+		ServerMetadata: self.ServerMetadata,
+		SecGroups:      self.SecGroups,
+		KeypairId:      self.KeypairId,
+		OsType:         self.OsType,
+		InstanceType:   self.InstanceType,
+		SizeMb:         self.SizeMb,
+
+		EncryptKeyId: self.EncryptKeyId,
+		Metadata:     allMetadata,
+	}
+	dbs, err := self.GetBackups()
+	if err != nil {
+		return nil, err
+	}
+	for i := range dbs {
+		mt := dbs[i].PackMetadata()
+		metadata.DiskMetadatas = append(metadata.DiskMetadatas, *mt)
+	}
+	return metadata, nil
+}
+
+/*func (manager *SInstanceBackupManager) CreateInstanceBackupFromPackage(ctx context.Context, owner mcclient.TokenCredential, backupStorageId, name string) (*SInstanceBackup, error) {
+	ib := &SInstanceBackup{}
+	ib.SetModelManager(manager, ib)
+	ib.ProjectId = owner.GetProjectId()
+	ib.DomainId = owner.GetProjectDomainId()
+	ib.Name = name
+	ib.BackupStorageId = backupStorageId
+	ib.CloudregionId = "default"
+	ib.Status = api.INSTANCE_BACKUP_STATUS_CREATING_FROM_PACKAGE
+	err := manager.TableSpec().Insert(ctx, ib)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to insert instance backup")
+	}
+	return ib, nil
+}*/
+
+func (ib *SInstanceBackup) PerformSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.InstanceBackupManagerSyncstatusInput) (jsonutils.JSONObject, error) {
+	var openTask = true
+	count, err := taskman.TaskManager.QueryTasksOfObject(ib, time.Now().Add(-3*time.Minute), &openTask).CountWithError()
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, httperrors.NewBadRequestError("InstanceBackup has %d task active, can't sync status", count)
+	}
+
+	return nil, StartResourceSyncStatusTask(ctx, userCred, ib, "InstanceBackupSyncstatusTask", "")
+}
+
+func (ib *SInstanceBackup) FillFromPackMetadata(ctx context.Context, userCred mcclient.TokenCredential, diskBackupIds []string, metadata *api.InstanceBackupPackMetadata) (*SInstanceBackup, error) {
+	if len(metadata.Metadata) > 0 {
+		// check class metadata
+		allOwner := db.AllMetadataOwner(metadata.Metadata)
+		err := db.RequireSameClass(ctx, allOwner, ib)
+		if err != nil {
+			return nil, errors.Wrap(err, "db.IsInSameClass")
+		}
+		meta := make(map[string]interface{})
+		for k, v := range metadata.Metadata {
+			meta[k] = v
+		}
+		ib.SetAllMetadata(ctx, meta, userCred)
+	}
+	if len(metadata.EncryptKeyId) > 0 {
+		session := auth.GetSession(ctx, userCred, consts.GetRegion(), "")
+		_, err := identity_modules.Credentials.GetEncryptKey(session, metadata.EncryptKeyId)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetEncryptKey")
+		}
+	}
+	for i, backupId := range diskBackupIds {
+		_, err := DiskBackupManager.CreateFromPackMetadata(ctx, userCred, ib.BackupStorageId, backupId, fmt.Sprintf("%s_disk_%d", ib.Name, i), &metadata.DiskMetadatas[i])
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to create diskbackup %s", backupId)
+		}
+		err = InstanceBackupJointManager.CreateJoint(ctx, ib.GetId(), backupId, int8(i))
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to CreateJoint for instanceBackup %s and diskBackup %s", ib.GetId(), backupId)
+		}
+	}
+	_, err := db.Update(ib, func() error {
+		ib.OsArch = metadata.OsArch
+		ib.ServerConfig = metadata.ServerConfig
+		ib.ServerMetadata = metadata.ServerMetadata
+		ib.SecGroups = metadata.SecGroups
+		ib.KeypairId = metadata.KeypairId
+		ib.OsType = metadata.OsType
+		ib.InstanceType = metadata.InstanceType
+		ib.SizeMb = metadata.SizeMb
+
+		ib.EncryptKeyId = metadata.EncryptKeyId
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ib, nil
+}
+
+func (self *SInstanceBackup) CustomizeCreate(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	query jsonutils.JSONObject,
+	data jsonutils.JSONObject,
+) error {
+	if len(self.GuestId) > 0 {
+		// use disk's ownerId instead of default ownerId
+		guestObj, err := GuestManager.FetchById(self.GuestId)
+		if err != nil {
+			return errors.Wrap(err, "GuestManager.FetchById")
+		}
+		ownerId = guestObj.(*SGuest).GetOwnerId()
+	}
+	return self.SVirtualResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }

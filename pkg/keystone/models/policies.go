@@ -17,6 +17,7 @@ package models
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -35,6 +36,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/keystone/locale"
+	"yunion.io/x/onecloud/pkg/keystone/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -86,7 +88,7 @@ type SPolicy struct {
 	Scope rbacutils.TRbacScope `nullable:"true" list:"user" create:"domain_required" update:"domain"`
 
 	// 是否为系统权限
-	IsSystem tristate.TriState `nullable:"false" default:"false" list:"domain" update:"admin" create:"admin_optional"`
+	IsSystem tristate.TriState `default:"false" list:"domain" update:"admin" create:"admin_optional"`
 
 	// 匹配的项目标签
 	ProjectTags tagutils.TTagSet `nullable:"true" list:"user" update:"domain" create:"domain_optional"`
@@ -151,7 +153,7 @@ func (manager *SPolicyManager) initializeRolePolicyGroup() error {
 				failed = true
 			} else {
 				for _, r := range roles {
-					err = RolePolicyManager.newRecord(ctx, r.Id, "", policies[i].Id, tristate.NewFromBool(policy.Auth), policy.Ips)
+					err = RolePolicyManager.newRecord(ctx, r.Id, "", policies[i].Id, tristate.NewFromBool(policy.Auth), policy.Ips, time.Time{}, time.Time{})
 					if err != nil {
 						log.Errorf("insert role policy fail %s", err)
 						failed = true
@@ -165,7 +167,7 @@ func (manager *SPolicyManager) initializeRolePolicyGroup() error {
 					log.Errorf("fetch role %s fail %s", r, err)
 					continue
 				}
-				err = RolePolicyManager.newRecord(ctx, role.Id, "", policies[i].Id, tristate.True, policy.Ips)
+				err = RolePolicyManager.newRecord(ctx, role.Id, "", policies[i].Id, tristate.True, policy.Ips, time.Time{}, time.Time{})
 				if err != nil {
 					log.Errorf("insert role policy fail %s", err)
 					failed = true
@@ -184,7 +186,7 @@ func (manager *SPolicyManager) initializeRolePolicyGroup() error {
 					failed = true
 				} else {
 					for _, r := range roles {
-						err = RolePolicyManager.newRecord(ctx, r.Id, project.Id, policies[i].Id, tristate.True, policy.Ips)
+						err = RolePolicyManager.newRecord(ctx, r.Id, project.Id, policies[i].Id, tristate.True, policy.Ips, time.Time{}, time.Time{})
 						if err != nil {
 							log.Errorf("insert role policy fail %s", err)
 							failed = true
@@ -205,7 +207,7 @@ func (manager *SPolicyManager) initializeRolePolicyGroup() error {
 						log.Errorf("fetch project %s fail %s", p, err)
 						continue
 					}
-					err = RolePolicyManager.newRecord(ctx, role.Id, project.Id, policies[i].Id, tristate.True, policy.Ips)
+					err = RolePolicyManager.newRecord(ctx, role.Id, project.Id, policies[i].Id, tristate.True, policy.Ips, time.Time{}, time.Time{})
 					if err != nil {
 						log.Errorf("insert role policy fail %s", err)
 						failed = true
@@ -239,10 +241,13 @@ func (manager *SPolicyManager) FetchEnabledPolicies() ([]SPolicy, error) {
 }
 
 func validatePolicyVioldatePrivilege(userCred mcclient.TokenCredential, policyScope rbacutils.TRbacScope, policy *rbacutils.SPolicy) error {
+	if options.Options.NoPolicyViolationCheck {
+		return nil
+	}
 	if userCred.GetUserName() == api.SystemAdminUser && userCred.GetDomainId() == api.DEFAULT_DOMAIN_ID {
 		return nil
 	}
-	_, policyGroup, err := RolePolicyManager.GetMatchPolicyGroup(userCred, false)
+	_, policyGroup, err := RolePolicyManager.GetMatchPolicyGroup(userCred, time.Time{}, false)
 	if err != nil {
 		return errors.Wrap(err, "GetMatchPolicyGroup")
 	}
@@ -659,7 +664,7 @@ func (policy *SPolicy) PerformBindRole(ctx context.Context, userCred mcclient.To
 			return nil, errors.Wrap(err, "RoleManager.FetchByIdOrName")
 		}
 	}
-	err = RolePolicyManager.newRecord(ctx, role.GetId(), projectId, policy.Id, tristate.True, prefList)
+	err = RolePolicyManager.newRecord(ctx, role.GetId(), projectId, policy.Id, tristate.True, prefList, input.ValidSince, input.ValidUntil)
 	if err != nil {
 		return nil, errors.Wrap(err, "newRecord")
 	}

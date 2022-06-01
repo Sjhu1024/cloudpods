@@ -78,6 +78,8 @@ type GenerateStartOptionsInput struct {
 	IsSlave               bool
 	IsMaster              bool
 	EnablePvpanic         bool
+
+	EncryptKeyPath string
 }
 
 func GenerateStartOptions(
@@ -178,8 +180,14 @@ func GenerateStartOptions(
 	// iothread object
 	opts = append(opts, drvOpt.Object("iothread", map[string]string{"id": "iothread0"}))
 
+	isEncrypt := false
+	if len(input.EncryptKeyPath) > 0 {
+		opts = append(opts, drvOpt.Object("secret", map[string]string{"id": "sec0", "file": input.EncryptKeyPath, "format": "base64"}))
+		isEncrypt = true
+	}
+
 	// genereate disk options
-	opts = append(opts, generateDisksOptions(drvOpt, input.Disks, input.PCIBus, input.IsVdiSpice)...)
+	opts = append(opts, generateDisksOptions(drvOpt, input.Disks, input.PCIBus, input.IsVdiSpice, isEncrypt)...)
 
 	// cdrom
 	opts = append(opts, drvOpt.Cdrom(input.CdromPath, input.OsName, input.IsQ35, len(input.Disks))...)
@@ -242,7 +250,7 @@ func getMonitorOptions(drvOpt QemuOptions, input *Monitor) []string {
 	return opts
 }
 
-func generateDisksOptions(drvOpt QemuOptions, disks []api.GuestdiskJsonDesc, pciBus string, isVdiSpice bool) []string {
+func generateDisksOptions(drvOpt QemuOptions, disks []api.GuestdiskJsonDesc, pciBus string, isVdiSpice bool, isEncrypt bool) []string {
 	opts := []string{}
 	isArm := drvOpt.IsArm()
 	firstDriver := make(map[string]bool)
@@ -259,7 +267,7 @@ func generateDisksOptions(drvOpt QemuOptions, disks []api.GuestdiskJsonDesc, pci
 					// FIXME: iothread will make qemu-monitor hang
 					// REF: https://www.mail-archive.com/qemu-devel@nongnu.org/msg592729.html
 					// cmd += " -device virtio-scsi-pci,id=scsi,iothread=iothread0,num_queues=4,vectors=5"
-					opts = append(opts, drvOpt.Device("virtio-scsi-pci,id=scsi,num_queues=4,vectors=5"))
+					opts = append(opts, drvOpt.Device("virtio-scsi-pci,id=scsi"))
 				case DISK_DRIVER_PVSCSI:
 					opts = append(opts, drvOpt.Device("pvscsi,id=scsi"))
 				}
@@ -267,14 +275,14 @@ func generateDisksOptions(drvOpt QemuOptions, disks []api.GuestdiskJsonDesc, pci
 			}
 		}
 		opts = append(opts,
-			getDiskDriveOption(drvOpt, disk, isArm),
+			getDiskDriveOption(drvOpt, disk, isArm, isEncrypt),
 			getDiskDeviceOption(drvOpt, disk, isArm, pciBus, isVdiSpice),
 		)
 	}
 	return opts
 }
 
-func getDiskDriveOption(drvOpt QemuOptions, disk api.GuestdiskJsonDesc, isArm bool) string {
+func getDiskDriveOption(drvOpt QemuOptions, disk api.GuestdiskJsonDesc, isArm bool, isEncrypt bool) string {
 	format := disk.Format
 	diskIndex := disk.Index
 	cacheMode := disk.CacheMode
@@ -297,6 +305,9 @@ func getDiskDriveOption(drvOpt QemuOptions, disk api.GuestdiskJsonDesc, isArm bo
 	}
 	if isLocalStorage(disk) {
 		opt += ",file.locking=off"
+	}
+	if isEncrypt {
+		opt += ",encrypt.format=luks,encrypt.key-secret=sec0"
 	}
 	// #opt += ",media=disk"
 	return drvOpt.Drive(opt)
@@ -361,7 +372,8 @@ func GetNicAddr(index int, disksLen int, isoDevsLen int, isVdiSpice bool) int {
 }
 
 func GetDiskAddr(idx int, isVdiSpice bool) int {
-	var base = 5
+	// host-bridge / isa-bridge / vga / serial / network / block / usb / rng
+	var base = 7
 	if isVdiSpice {
 		base += 10
 	}
@@ -385,10 +397,13 @@ func GetDiskDeviceModel(driver string) string {
 func generateNicOptions(drvOpt QemuOptions, input *GenerateStartOptionsInput) ([]string, error) {
 	opts := []string{}
 	nics := input.Nics
-	withAddr := true
-	if drvOpt.IsArm() {
-		withAddr = false
-	}
+	/*
+	 * withAddr := true
+	 * if drvOpt.IsArm() {
+	 * 	withAddr = false
+	 * }
+	 */
+	withAddr := false
 	for idx := range nics {
 		netDevOpt, err := getNicNetdevOption(drvOpt, nics[idx], input.IsKVMSupport)
 		if err != nil {

@@ -287,6 +287,18 @@ func (self *SESXiGuestDriver) GetJsonDescAtHost(ctx context.Context, userCred mc
 	if len(desc.Disks) == 0 {
 		return jsonutils.Marshal(desc), nil
 	}
+	for i := range desc.Disks {
+		diskId := desc.Disks[i].DiskId
+		disk := models.DiskManager.FetchDiskById(diskId)
+		if disk == nil {
+			return nil, fmt.Errorf("unable to fetch disk %s", diskId)
+		}
+		storage, err := disk.GetStorage()
+		if storage == nil {
+			return nil, errors.Wrapf(err, "unable to fetch storage of disk %s", diskId)
+		}
+		desc.Disks[i].StorageId = storage.GetExternalId()
+	}
 	templateId := desc.Disks[0].TemplateId
 	if len(templateId) == 0 {
 		// try to check instance_snapshot_id
@@ -427,13 +439,13 @@ func (self *SESXiGuestDriver) RequestDeployGuestOnHost(ctx context.Context, gues
 	return err
 }
 
-func (self *SESXiGuestDriver) RqeuestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+func (self *SESXiGuestDriver) RequestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		host, _ := guest.GetHost()
 		if host == nil {
 			return nil, errors.Error("fail to get host of guest")
 		}
-		ihost, err := host.GetIHost()
+		ihost, err := host.GetIHost(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -451,13 +463,13 @@ func (self *SESXiGuestDriver) RqeuestSuspendOnHost(ctx context.Context, guest *m
 	return nil
 }
 
-func (self *SESXiGuestDriver) RqeuestResumeOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+func (self *SESXiGuestDriver) RequestResumeOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		host, _ := guest.GetHost()
 		if host == nil {
 			return nil, errors.Error("fail to get host of guest")
 		}
-		ihost, err := host.GetIHost()
+		ihost, err := host.GetIHost(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -478,10 +490,10 @@ func (self *SESXiGuestDriver) RqeuestResumeOnHost(ctx context.Context, guest *mo
 func (self *SESXiGuestDriver) OnGuestDeployTaskDataReceived(ctx context.Context, guest *models.SGuest, task taskman.ITask, data jsonutils.JSONObject) error {
 
 	if data.Contains("host_ip") {
+		oldHost, _ := guest.GetHost()
 		hostIp, _ := data.GetString("host_ip")
-		host, err := models.HostManager.GetHostByIp(hostIp)
+		host, err := models.HostManager.GetHostByIp(oldHost.ManagerId, api.HOST_TYPE_ESXI, hostIp)
 		if err != nil {
-			log.Errorf("fail to find host with IP %s: %s", hostIp, err)
 			return err
 		}
 		if host.Id != guest.HostId {
@@ -514,7 +526,7 @@ func (self *SESXiGuestDriver) DoGuestCreateDisksTask(ctx context.Context, guest 
 	return nil
 }
 
-func (self *SESXiGuestDriver) RequestRenewInstance(guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
+func (self *SESXiGuestDriver) RequestRenewInstance(ctx context.Context, guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
 	return time.Time{}, nil
 }
 
@@ -550,7 +562,7 @@ func (self *SESXiGuestDriver) CheckLiveMigrate(ctx context.Context, guest *model
 
 func (self *SESXiGuestDriver) RequestMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iVM, err := guest.GetIVM()
+		iVM, err := guest.GetIVM(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "guest.GetIVM")
 		}
@@ -595,7 +607,7 @@ func (self *SESXiGuestDriver) RequestMigrate(ctx context.Context, guest *models.
 
 func (self *SESXiGuestDriver) RequestLiveMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iVM, err := guest.GetIVM()
+		iVM, err := guest.GetIVM(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "guest.GetIVM")
 		}
@@ -639,7 +651,7 @@ func (self *SESXiGuestDriver) RequestLiveMigrate(ctx context.Context, guest *mod
 }
 
 func (self *SESXiGuestDriver) RequestStartOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, userCred mcclient.TokenCredential, task taskman.ITask) error {
-	ivm, err := guest.GetIVM()
+	ivm, err := guest.GetIVM(ctx)
 	if err != nil {
 		return errors.Wrapf(err, "GetIVM")
 	}
@@ -662,7 +674,7 @@ func (self *SESXiGuestDriver) RequestStartOnHost(ctx context.Context, guest *mod
 
 func (self *SESXiGuestDriver) RequestStopOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask, syncStatus bool) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		ivm, err := guest.GetIVM()
+		ivm, err := guest.GetIVM(ctx)
 		if err != nil {
 			return nil, errors.Wrapf(err, "guest.GetIVM")
 		}
@@ -683,7 +695,7 @@ func (self *SESXiGuestDriver) RequestStopOnHost(ctx context.Context, guest *mode
 
 func (self *SESXiGuestDriver) RequestSyncstatusOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, userCred mcclient.TokenCredential, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		ihost, err := host.GetIHost()
+		ihost, err := host.GetIHost(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "host.GetIHost")
 		}

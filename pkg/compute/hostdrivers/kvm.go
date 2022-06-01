@@ -247,7 +247,10 @@ func (self *SKVMHostDriver) RequestAllocateDiskOnStorage(ctx context.Context, us
 		snapshot := snapObj.(*models.SSnapshot)
 		snapshotStorage := models.StorageManager.FetchStorageById(snapshot.StorageId)
 		if snapshotStorage.StorageType == api.STORAGE_LOCAL {
-			snapshotHost := snapshotStorage.GetMasterHost()
+			snapshotHost, err := snapshotStorage.GetMasterHost()
+			if err != nil {
+				return errors.Wrapf(err, "GetMasterHost")
+			}
 			if options.Options.SnapshotCreateDiskProtocol == "url" {
 				input.SnapshotUrl = fmt.Sprintf("%s/download/snapshots/%s/%s/%s", snapshotHost.ManagerUri, snapshotStorage.Id, snapshot.DiskId, snapshot.Id)
 				input.SnapshotOutOfChain = snapshot.OutOfChain
@@ -309,6 +312,13 @@ func (self *SKVMHostDriver) RequestResizeDiskOnHost(ctx context.Context, host *m
 	body := jsonutils.NewDict()
 	content := jsonutils.NewDict()
 	content.Add(jsonutils.NewInt(sizeMb), "size")
+	if disk.IsEncrypted() {
+		info, err := disk.GetEncryptInfo(ctx, task.GetUserCred())
+		if err != nil {
+			return errors.Wrap(err, "disk.GetEncryptInfo")
+		}
+		content.Add(jsonutils.Marshal(info), "encrypt_info")
+	}
 	guest := disk.GetGuest()
 	if guest != nil {
 		content.Add(jsonutils.NewString(guest.Id), "server_id")
@@ -333,7 +343,14 @@ func (self *SKVMHostDriver) RequestSaveUploadImageOnHost(ctx context.Context, ho
 	body := jsonutils.NewDict()
 	backup, _ := data.GetString("backup")
 	storage, _ := disk.GetStorage()
-	content := map[string]string{"image_path": backup, "image_id": imageId, "storagecached_id": storage.StoragecacheId}
+	content := map[string]string{
+		"image_path":       backup,
+		"image_id":         imageId,
+		"storagecached_id": storage.StoragecacheId,
+	}
+	if disk.IsEncrypted() {
+		content["encrypt_key_id"] = disk.EncryptKeyId
+	}
 	if data.Contains("format") {
 		content["format"], _ = data.GetString("format")
 	}
@@ -375,6 +392,14 @@ func (self *SKVMHostDriver) RequestResetDisk(ctx context.Context, host *models.S
 	url := fmt.Sprintf("/disks/%s/reset/%s", disk.StorageId, disk.Id)
 
 	header := task.GetTaskRequestHeader()
+
+	if disk.IsEncrypted() {
+		info, err := disk.GetEncryptInfo(ctx, task.GetUserCred())
+		if err != nil {
+			return errors.Wrap(err, "disk.GetEncryptInfo")
+		}
+		params.Add(jsonutils.Marshal(info), "encrypt_info")
+	}
 
 	_, err := host.Request(ctx, task.GetUserCred(), "POST", url, header, params)
 	return err

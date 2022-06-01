@@ -30,6 +30,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/qemu"
 	qemucerts "yunion.io/x/onecloud/pkg/hostman/guestman/qemu/certs"
@@ -131,6 +132,10 @@ func (s *SKVMGuestInstance) isQ35() bool {
 	return s.getMachine() == api.VM_MACHINE_TYPE_Q35
 }
 
+func (s *SKVMGuestInstance) isVirt() bool {
+	return s.getMachine() == api.VM_MACHINE_TYPE_ARM_VIRT
+}
+
 func (s *SKVMGuestInstance) GetVdiProtocol() string {
 	vdi, err := s.Desc.GetString("vdi")
 	if err != nil {
@@ -140,7 +145,7 @@ func (s *SKVMGuestInstance) GetVdiProtocol() string {
 }
 
 func (s *SKVMGuestInstance) GetPciBus() string {
-	if s.isQ35() {
+	if s.isQ35() || s.isVirt() {
 		return "pcie.0"
 	} else {
 		return "pci.0"
@@ -236,8 +241,15 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 			HomeDir:              s.HomeDir(),
 			HugepagesEnabled:     s.manager.host.IsHugepagesEnabled(),
 			PidFilePath:          s.GetPidFilePath(),
+			BIOS:                 s.getBios(),
 		}
 	)
+
+	if data.Contains("encrypt_key") {
+		key, _ := data.GetString("encrypt_key")
+		s.saveEncryptKeyFile(key)
+		input.EncryptKeyPath = s.getEncryptKeyPath()
+	}
 
 	cmd := ""
 
@@ -305,7 +317,7 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 	}
 	cmd += diskScripts
 
-	// cmd += fmt.Sprintf("STATE_FILE=`ls -d %s* | head -n 1`\n", s.getStateFilePathRootPrefix())
+	cmd += fmt.Sprintf("STATE_FILE=`ls -d %s* | head -n 1`\n", s.getStateFilePathRootPrefix())
 	cmd += fmt.Sprintf("PID_FILE=%s\n", input.PidFilePath)
 
 	var qemuCmd = qemutils.GetQemu(string(input.QemuVersion))
@@ -314,26 +326,34 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 	}
 
 	cmd += fmt.Sprintf("DEFAULT_QEMU_CMD='%s'\n", qemuCmd)
-	// cmd += "if [ -n \"$STATE_FILE\" ]; then\n"
-	// cmd += "    QEMU_VER=`echo $STATE_FILE" +
-	// 	` | grep -o '_[[:digit:]]\+\.[[:digit:]]\+.*'` + "`\n"
-	// cmd += "    QEMU_CMD=\"qemu-system-x86_64\"\n"
-	// cmd += "    QEMU_LOCAL_PATH=\"/usr/local/bin/$QEMU_CMD\"\n"
-	// cmd += "    QEMU_LOCAL_PATH_VER=\"/usr/local/qemu-$QEMU_VER/bin/$QEMU_CMD\"\n"
-	// cmd += "    QEMU_BIN_PATH=\"/usr/bin/$QEMU_CMD\"\n"
-	// cmd += "    if [ -f \"$QEMU_LOCAL_PATH_VER\" ]; then\n"
-	// cmd += "        QEMU_CMD=$QEMU_LOCAL_PATH_VER\n"
-	// cmd += "    elif [ -f \"$QEMU_LOCAL_PATH\" ]; then\n"
-	// cmd += "        QEMU_CMD=$QEMU_LOCAL_PATH\n"
-	// cmd += "    elif [ -f \"$QEMU_BIN_PATH\" ]; then\n"
-	// cmd += "        QEMU_CMD=$QEMU_BIN_PATH\n"
-	// cmd += "    fi\n"
-	// cmd += "else\n"
+	/*
+	 * cmd += "if [ -n \"$STATE_FILE\" ]; then\n"
+	 * cmd += "    QEMU_VER=`echo $STATE_FILE" +
+	 * 	` | grep -o '_[[:digit:]]\+\.[[:digit:]]\+.*'` + "`\n"
+	 * cmd += "    QEMU_CMD=\"qemu-system-x86_64\"\n"
+	 * cmd += "    QEMU_LOCAL_PATH=\"/usr/local/bin/$QEMU_CMD\"\n"
+	 * cmd += "    QEMU_LOCAL_PATH_VER=\"/usr/local/qemu-$QEMU_VER/bin/$QEMU_CMD\"\n"
+	 * cmd += "    QEMU_BIN_PATH=\"/usr/bin/$QEMU_CMD\"\n"
+	 * cmd += "    if [ -f \"$QEMU_LOCAL_PATH_VER\" ]; then\n"
+	 * cmd += "        QEMU_CMD=$QEMU_LOCAL_PATH_VER\n"
+	 * cmd += "    elif [ -f \"$QEMU_LOCAL_PATH\" ]; then\n"
+	 * cmd += "        QEMU_CMD=$QEMU_LOCAL_PATH\n"
+	 * cmd += "    elif [ -f \"$QEMU_BIN_PATH\" ]; then\n"
+	 * cmd += "        QEMU_CMD=$QEMU_BIN_PATH\n"
+	 * cmd += "    fi\n"
+	 * cmd += "else\n"
+	 * cmd += "    QEMU_CMD=$DEFAULT_QEMU_CMD\n"
+	 * cmd += "fi\n"
+	 */
 	cmd += "QEMU_CMD=$DEFAULT_QEMU_CMD\n"
 	if s.IsKvmSupport() && !options.HostOptions.DisableKVM {
 		cmd += "QEMU_CMD_KVM_ARG=-enable-kvm\n"
-	} else {
+	} else if utils.IsInStringArray(s.manager.host.GetCpuArchitecture(), apis.ARCH_X86) {
+		// -no-kvm仅x86适用，且将在qemu 5.2之后移除
+		// https://gitlab.com/qemu-project/qemu/-/blob/master/docs/about/removed-features.rst
 		cmd += "QEMU_CMD_KVM_ARG=-no-kvm\n"
+	} else {
+		cmd += "QEMU_CMD_KVM_ARG=\n"
 	}
 	// cmd += "fi\n"
 	cmd += `
@@ -402,9 +422,15 @@ function nic_mtu() {
 	}
 
 	// UEFI ovmf file path
-	if s.getBios() == qemu.BIOS_UEFI || input.QemuArch == qemu.Arch_aarch64 {
-		input.BIOS = qemu.BIOS_UEFI
-		input.OVMFPath = options.HostOptions.OvmfPath
+	if input.QemuArch == qemu.Arch_aarch64 {
+		if !strings.HasPrefix(input.BIOS, qemu.BIOS_UEFI) {
+			input.BIOS = qemu.BIOS_UEFI
+		}
+	}
+	if input.BIOS == qemu.BIOS_UEFI {
+		if len(input.OVMFPath) == 0 {
+			input.OVMFPath = options.HostOptions.OvmfPath
+		}
 	}
 
 	// inject nic and disks
@@ -428,10 +454,10 @@ function nic_mtu() {
 	// inject devices
 	if input.QemuArch == qemu.Arch_aarch64 {
 		input.Devices = append(input.Devices,
-			"qemu-xhci,p2=8,p3=8,id=usb",
-			"usb-tablet,id=input0,bus=usb.0,port=1",
-			"usb-kbd,id=input1,bus=usb.0,port=2",
-			"virtio-gpu-pci,id=video0,max_outputs=1",
+			"qemu-xhci,p2=8,p3=8,id=usb1",
+			"usb-tablet,id=input0,bus=usb1.0,port=1",
+			"usb-kbd,id=input1,bus=usb1.0,port=2",
+			"virtio-gpu-pci,id=video1,max_outputs=1",
 		)
 	} else {
 		if !utils.IsInStringArray(s.getOsDistribution(), []string{OS_NAME_OPENWRT, OS_NAME_CIRROS}) &&
@@ -516,15 +542,15 @@ function nic_mtu() {
 		return "", errors.Wrap(err, "GenerateStartCommand")
 	}
 	cmd = fmt.Sprintf("%s %s", cmd, qemuOpts)
-
 	cmd += "\"\n"
-	// cmd += "if [ ! -z \"$STATE_FILE\" ] && [ -d \"$STATE_FILE\" ] && [ -f \"$STATE_FILE/content\" ]; then\n"
-	// cmd += "    $CMD --incoming \"exec: cat $STATE_FILE/content\"\n"
-	// cmd += "elif [ ! -z \"$STATE_FILE\" ] && [ -f $STATE_FILE ]; then\n"
-	// cmd += "    $CMD --incoming \"exec: cat $STATE_FILE\"\n"
-	// cmd += "else\n"
-	cmd += "$CMD\n"
-	// cmd += "fi\n"
+
+	cmd += `
+if [ ! -z "$STATE_FILE" ] && [ -d "$STATE_FILE" ] && [ -f "$STATE_FILE/content" ]; then
+    CMD="$CMD --incoming \"exec: cat $STATE_FILE/content\""
+elif [ ! -z "$STATE_FILE" ] && [ -f "$STATE_FILE" ]; then
+    CMD="$CMD --incoming \"exec: cat $STATE_FILE\""
+fi
+eval $CMD`
 
 	return cmd, nil
 }

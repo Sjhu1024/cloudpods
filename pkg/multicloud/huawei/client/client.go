@@ -28,11 +28,9 @@ type Client struct {
 	init bool
 
 	Balances             *modules.SBalanceManager
-	Bandwidths           *modules.SBandwidthManager
 	Credentials          *modules.SCredentialManager
 	Disks                *modules.SDiskManager
 	Domains              *modules.SDomainManager
-	Eips                 *modules.SEipManager
 	Elasticcache         *modules.SElasticcacheManager
 	DcsAvailableZone     *modules.SDcsAvailableZoneManager
 	Flavors              *modules.SFlavorManager
@@ -41,15 +39,6 @@ type Client struct {
 	Interface            *modules.SInterfaceManager
 	Jobs                 *modules.SJobManager
 	Keypairs             *modules.SKeypairManager
-	Elb                  *modules.SLoadbalancerManager
-	ElbBackend           *modules.SElbBackendManager
-	ElbBackendGroup      *modules.SElbBackendGroupManager
-	ElbListeners         *modules.SElbListenersManager
-	ElbCertificates      *modules.SElbCertificatesManager
-	ElbHealthCheck       *modules.SElbHealthCheckManager
-	ElbL7policies        *modules.SElbL7policiesManager
-	ElbPolicies          *modules.SElbPoliciesManager
-	ElbWhitelist         *modules.SElbWhitelistManager
 	Orders               *modules.SOrderManager
 	Port                 *modules.SPortManager
 	Projects             *modules.SProjectManager
@@ -84,6 +73,7 @@ type Client struct {
 	SAMLProviders        *modules.SAMLProviderManager
 	SAMLProviderMappings *modules.SAMLProviderMappingManager
 	SfsTurbos            *modules.SfsTurboManager
+	RouteTables          *modules.SRouteTableManager
 }
 
 type SClientConfig struct {
@@ -133,21 +123,11 @@ func (self *Client) SetHttpClient(httpClient *http.Client) {
 	self.Regions.SetHttpClient(httpClient)
 	self.Zones.SetHttpClient(httpClient)
 	self.Vpcs.SetHttpClient(httpClient)
-	self.Eips.SetHttpClient(httpClient)
 	self.Elasticcache.SetHttpClient(httpClient)
 	self.DcsAvailableZone.SetHttpClient(httpClient)
 	self.Disks.SetHttpClient(httpClient)
 	self.Domains.SetHttpClient(httpClient)
 	self.Keypairs.SetHttpClient(httpClient)
-	self.Elb.SetHttpClient(httpClient)
-	self.ElbBackend.SetHttpClient(httpClient)
-	self.ElbBackendGroup.SetHttpClient(httpClient)
-	self.ElbListeners.SetHttpClient(httpClient)
-	self.ElbCertificates.SetHttpClient(httpClient)
-	self.ElbHealthCheck.SetHttpClient(httpClient)
-	self.ElbL7policies.SetHttpClient(httpClient)
-	self.ElbPolicies.SetHttpClient(httpClient)
-	self.ElbWhitelist.SetHttpClient(httpClient)
 	self.Orders.SetHttpClient(httpClient)
 	self.SecurityGroupRules.SetHttpClient(httpClient)
 	self.SecurityGroups.SetHttpClient(httpClient)
@@ -157,7 +137,6 @@ func (self *Client) SetHttpClient(httpClient *http.Client) {
 	self.Interface.SetHttpClient(httpClient)
 	self.Jobs.SetHttpClient(httpClient)
 	self.Balances.SetHttpClient(httpClient)
-	self.Bandwidths.SetHttpClient(httpClient)
 	self.Port.SetHttpClient(httpClient)
 	self.Flavors.SetHttpClient(httpClient)
 	self.VpcRoutes.SetHttpClient(httpClient)
@@ -176,6 +155,7 @@ func (self *Client) SetHttpClient(httpClient *http.Client) {
 	self.SAMLProviders.SetHttpClient(httpClient)
 	self.SAMLProviderMappings.SetHttpClient(httpClient)
 	self.SfsTurbos.SetHttpClient(httpClient)
+	self.RouteTables.SetHttpClient(httpClient)
 }
 
 func (self *Client) InitWithAccessKey(endpoint, regionId, domainId, projectId, accessKey, secretKey string, debug bool) error {
@@ -217,21 +197,11 @@ func (self *Client) initManagers() {
 		self.Regions = modules.NewRegionManager(self.cfg)
 		self.Zones = modules.NewZoneManager(self.cfg)
 		self.Vpcs = modules.NewVpcManager(self.cfg)
-		self.Eips = modules.NewEipManager(self.cfg)
 		self.Elasticcache = modules.NewElasticcacheManager(self.cfg)
 		self.DcsAvailableZone = modules.NewDcsAvailableZoneManager(self.cfg)
 		self.Disks = modules.NewDiskManager(self.cfg)
 		self.Domains = modules.NewDomainManager(self.cfg)
 		self.Keypairs = modules.NewKeypairManager(self.cfg)
-		self.Elb = modules.NewLoadbalancerManager(self.cfg)
-		self.ElbBackend = modules.NewElbBackendManager(self.cfg)
-		self.ElbBackendGroup = modules.NewElbBackendGroupManager(self.cfg)
-		self.ElbListeners = modules.NewElbListenersManager(self.cfg)
-		self.ElbCertificates = modules.NewElbCertificatesManager(self.cfg)
-		self.ElbHealthCheck = modules.NewElbHealthCheckManager(self.cfg)
-		self.ElbL7policies = modules.NewElbL7policiesManager(self.cfg)
-		self.ElbPolicies = modules.NewElbPoliciesManager(self.cfg)
-		self.ElbWhitelist = modules.NewElbWhitelistManager(self.cfg)
 		self.Orders = modules.NewOrderManager(self.cfg)
 		self.SecurityGroupRules = modules.NewSecgroupRuleManager(self.cfg)
 		self.SecurityGroups = modules.NewSecurityGroupManager(self.cfg)
@@ -241,7 +211,6 @@ func (self *Client) initManagers() {
 		self.Interface = modules.NewInterfaceManager(self.cfg)
 		self.Jobs = modules.NewJobManager(self.cfg)
 		self.Balances = modules.NewBalanceManager(self.cfg)
-		self.Bandwidths = modules.NewBandwidthManager(self.cfg)
 		self.Credentials = modules.NewCredentialManager(self.cfg)
 		self.Port = modules.NewPortManager(self.cfg)
 		self.Flavors = modules.NewFlavorManager(self.cfg)
@@ -263,6 +232,7 @@ func (self *Client) initManagers() {
 		self.SAMLProviders = modules.NewSAMLProviderManager(self.cfg)
 		self.SAMLProviderMappings = modules.NewSAMLProviderMappingManager(self.cfg)
 		self.SfsTurbos = modules.NewSfsTurboManager(self.cfg)
+		self.RouteTables = modules.NewRouteTableManager(self.cfg)
 	}
 
 	self.init = true

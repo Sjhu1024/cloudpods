@@ -208,7 +208,7 @@ func (self *SKVMGuestDriver) GetGuestVncInfo(ctx context.Context, userCred mccli
 		Host:       host.AccessIp,
 		Protocol:   guest.GetVdi(),
 		Port:       int64(port),
-		Hypervisor: api.HYPERVISOR_ESXI,
+		Hypervisor: api.HYPERVISOR_KVM,
 	}
 	return result, nil
 }
@@ -308,7 +308,7 @@ func (self *SKVMGuestDriver) RequestSyncstatusOnHost(ctx context.Context, guest 
 	header := self.getTaskRequestHeader(task)
 
 	url := fmt.Sprintf("%s/servers/%s/status", host.ManagerUri, guest.Id)
-	_, res, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "GET", url, header, nil, true)
+	_, res, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "GET", url, header, nil, false)
 	if err != nil {
 		return err
 	}
@@ -601,9 +601,17 @@ func (self *SKVMGuestDriver) RequestSyncConfigOnHost(ctx context.Context, guest 
 	return err
 }
 
-func (self *SKVMGuestDriver) RqeuestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+func (self *SKVMGuestDriver) RequestSuspendOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	host, _ := guest.GetHost()
 	url := fmt.Sprintf("%s/servers/%s/suspend", host.ManagerUri, guest.Id)
+	header := self.getTaskRequestHeader(task)
+	_, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, nil, false)
+	return err
+}
+
+func (self *SKVMGuestDriver) RequestResumeOnHost(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+	host, _ := guest.GetHost()
+	url := fmt.Sprintf("%s/servers/%s/start", host.ManagerUri, guest.Id)
 	header := self.getTaskRequestHeader(task)
 	_, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, nil, false)
 	return err
@@ -826,7 +834,7 @@ func (self *SKVMGuestDriver) RequestChangeDiskStorage(ctx context.Context, userC
 
 func (self *SKVMGuestDriver) validateVdiProtocol(vdi string) error {
 	if !utils.IsInStringArray(vdi, []string{api.VM_VDI_PROTOCOL_VNC, api.VM_VDI_PROTOCOL_SPICE}) {
-		return httperrors.NewInputParameterError("unsupported vdi protocol")
+		return httperrors.NewInputParameterError("unsupported vdi protocol %s", vdi)
 	}
 	return nil
 }
@@ -924,4 +932,35 @@ func (self *SKVMGuestDriver) ValidateUpdateData(ctx context.Context, guest *mode
 
 func (self *SKVMGuestDriver) RequestSyncIsolatedDevice(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
 	return guest.StartSyncTask(ctx, task.GetUserCred(), false, task.GetTaskId())
+}
+
+func (self *SKVMGuestDriver) RequestCPUSet(ctx context.Context, userCred mcclient.TokenCredential, host *models.SHost, guest *models.SGuest, input *api.ServerCPUSetInput) (*api.ServerCPUSetResp, error) {
+	url := fmt.Sprintf("%s/servers/%s/cpuset", host.ManagerUri, guest.Id)
+	httpClient := httputils.GetDefaultClient()
+	header := mcclient.GetTokenHeaders(userCred)
+	body := jsonutils.Marshal(input)
+	_, respBody, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, body, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "host request")
+	}
+	resp := new(api.ServerCPUSetResp)
+	if respBody == nil {
+		return resp, nil
+	}
+	if err := respBody.Unmarshal(resp); err != nil {
+		return nil, errors.Wrap(err, "unmarshal response")
+	}
+	return resp, nil
+}
+
+func (self *SKVMGuestDriver) RequestCPUSetRemove(ctx context.Context, userCred mcclient.TokenCredential, host *models.SHost, guest *models.SGuest, input *api.ServerCPUSetRemoveInput) error {
+	url := fmt.Sprintf("%s/servers/%s/cpuset-remove", host.ManagerUri, guest.Id)
+	httpClient := httputils.GetDefaultClient()
+	header := mcclient.GetTokenHeaders(userCred)
+	body := jsonutils.Marshal(input)
+	_, _, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, body, false)
+	if err != nil {
+		return errors.Wrap(err, "host request")
+	}
+	return nil
 }

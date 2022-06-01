@@ -304,11 +304,15 @@ func (m *HmpMonitor) DeviceAdd(dev string, params map[string]interface{}, callba
 	m.Query(fmt.Sprintf("device_add %s,%s", dev, strings.Join(paramsKvs, ",")), callback)
 }
 
+func (m *HmpMonitor) MigrateSetDowntime(dtSec float32, callback StringCallback) {
+	m.Query(fmt.Sprintf("migrate_set_downtime %f", dtSec), callback)
+}
+
 func (m *HmpMonitor) MigrateSetCapability(capability, state string, callback StringCallback) {
 	m.Query(fmt.Sprintf("migrate_set_capability %s %s", capability, state), callback)
 }
 
-func (m *HmpMonitor) MigrateSetParameter(key string, val string, callback StringCallback) {
+func (m *HmpMonitor) MigrateSetParameter(key string, val interface{}, callback StringCallback) {
 	cmd := fmt.Sprintf("migrate_set_parameter %s %s", key, val)
 	m.Query(cmd, callback)
 }
@@ -499,5 +503,10 @@ func (m *HmpMonitor) NetdevAdd(id, netType string, params map[string]string, cal
 
 func (m *HmpMonitor) NetdevDel(id string, callback StringCallback) {
 	cmd := fmt.Sprintf("netdev_del %s", id)
+	m.Query(cmd, callback)
+}
+
+func (m *HmpMonitor) SaveState(stateFilePath string, callback StringCallback) {
+	cmd := fmt.Sprintf(`migrate -d "%s"`, getSaveStatefileUri(stateFilePath))
 	m.Query(cmd, callback)
 }

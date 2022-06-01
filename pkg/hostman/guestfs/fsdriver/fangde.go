@@ -61,7 +61,7 @@ func (d *SFangdeRootFs) GetReleaseInfo(rootFs IDiskPartition) *deployapi.Release
 
 func (d *SFangdeRootFs) DeployNetworkingScripts(rootFs IDiskPartition, nics []*types.SServerNic) error {
 	relInfo := d.GetReleaseInfo(rootFs)
-	if err := d.sRedhatLikeRootFs.deployNetworkingScripts(rootFs, nics, relInfo, true); err != nil {
+	if err := d.sRedhatLikeRootFs.deployNetworkingScripts(rootFs, nics, relInfo); err != nil {
 		return err
 	}
 	return nil
@@ -73,4 +73,31 @@ func (c *SFangdeRootFs) EnableSerialConsole(rootFs IDiskPartition, sysInfo *json
 
 func (c *SFangdeRootFs) DisableSerialConsole(rootFs IDiskPartition) error {
 	return c.disableSerialConcole(c, rootFs)
+}
+
+type SFangdeDeskRootfs struct {
+	*SUbuntuRootFs
+}
+
+func NewFangdeDeskRootfs(part IDiskPartition) IRootFsDriver {
+	return &SFangdeDeskRootfs{SUbuntuRootFs: NewUbuntuRootFs(part).(*SUbuntuRootFs)}
+}
+
+func (d *SFangdeDeskRootfs) GetName() string {
+	return "Nfs"
+}
+
+func (d *SFangdeDeskRootfs) String() string {
+	return "FangdeDeskRootfs"
+}
+
+func (d *SFangdeDeskRootfs) RootSignatures() []string {
+	sig := d.sDebianLikeRootFs.RootSignatures()
+	return append([]string{"/etc/lsb-release", "/etc/Guestos-release"}, sig...)
+}
+
+func (d *SFangdeDeskRootfs) GetReleaseInfo(rootFs IDiskPartition) *deployapi.ReleaseInfo {
+	info := d.SUbuntuRootFs.GetReleaseInfo(rootFs)
+	info.Distro = d.GetName()
+	return info
 }

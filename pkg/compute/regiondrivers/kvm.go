@@ -29,8 +29,10 @@ import (
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	hostapi "yunion.io/x/onecloud/pkg/apis/host"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	"yunion.io/x/onecloud/pkg/cloudprovider"
@@ -39,7 +41,7 @@ import (
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/httputils"
-	"yunion.io/x/onecloud/pkg/util/rand"
+	randutil "yunion.io/x/onecloud/pkg/util/rand"
 )
 
 type SKVMRegionDriver struct {
@@ -82,28 +84,71 @@ func (self *SKVMRegionDriver) GenerateSecurityGroupName(name string) string {
 
 func (self *SKVMRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	networkV := validators.NewModelIdOrNameValidator("network", "network", ownerId)
+	networkV.Optional(true)
+	if err := networkV.Validate(data); err != nil {
+		return nil, err
+	}
+
+	var network *models.SNetwork
+	if networkV.Model != nil {
+		network = networkV.Model.(*models.SNetwork)
+	} else {
+		vpcV := validators.NewModelIdOrNameValidator("vpc", "vpc", ownerId)
+		if err := vpcV.Validate(data); err != nil {
+			return nil, err
+		}
+		// find available networks
+		vpc := vpcV.Model.(*models.SVpc)
+		networks, err := vpc.GetNetworks()
+		if err != nil {
+			return nil, httperrors.NewGeneralError(err)
+		}
+		networksLen := len(networks)
+		if networksLen > 0 {
+			i := randutil.Intn(networksLen)
+			j := (i + 1) % networksLen
+			for {
+				net := &networks[j]
+				addrCount, err := net.GetFreeAddressCount()
+				if err != nil {
+					continue
+				}
+				if addrCount > 0 {
+					network = net
+					break
+				}
+
+				j = (j + 1) % networksLen
+				if j == i {
+					break
+				}
+			}
+		}
+		if network == nil {
+			return nil, httperrors.NewBadRequestError("no usable network in vpc %s(%s)", vpc.Name, vpc.Id)
+		}
+	}
+	if network.ServerType != api.NETWORK_TYPE_GUEST {
+		return nil, httperrors.NewBadRequestError("only network type %q is allowed", api.NETWORK_TYPE_GUEST)
+	}
+
 	addressV := validators.NewIPv4AddrValidator("address")
 	clusterV := validators.NewModelIdOrNameValidator("cluster", "loadbalancercluster", ownerId)
 	keyV := map[string]validators.IValidator{
 		"status":  validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
 		"address": addressV.Optional(true),
-		"network": networkV,
 		"cluster": clusterV.Optional(true),
 	}
 	if err := RunValidators(keyV, data, false); err != nil {
 		return nil, err
 	}
 
-	network := networkV.Model.(*models.SNetwork)
 	region, zone, vpc, _, err := network.ValidateElbNetwork(addressV.IP)
 	if err != nil {
 		return nil, err
 	}
 	if zone == nil {
 		return nil, httperrors.NewInputParameterError("zone info missing")
-	}
-	if vpc.Id != api.DEFAULT_VPC_ID {
-		return nil, httperrors.NewInputParameterError("vpc lb is not allowed for now")
 	}
 
 	if clusterV.Model == nil {
@@ -133,7 +178,7 @@ func (self *SKVMRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context
 		} else {
 			return nil, httperrors.NewInputParameterError("no viable lbcluster")
 		}
-		i := rand.Intn(len(choices))
+		i := randutil.Intn(len(choices))
 		data.Set("cluster_id", jsonutils.NewString(choices[i].Id))
 	} else {
 		cluster := clusterV.Model.(*models.SLoadbalancerCluster)
@@ -147,10 +192,35 @@ func (self *SKVMRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context
 		}
 	}
 
+	lbNetworkType := api.LB_NETWORK_TYPE_VPC
+	if vpc.Id == api.DEFAULT_VPC_ID {
+		lbNetworkType = api.LB_NETWORK_TYPE_CLASSIC
+	}
+	eipId, _ := data.GetString("eip")
+	if len(eipId) > 0 {
+		_eip, err := validators.ValidateModel(userCred, models.ElasticipManager, &eipId)
+		if err != nil {
+			return nil, err
+		}
+		eip := _eip.(*models.SElasticip)
+		if eip.CloudregionId != region.GetId() {
+			return nil, httperrors.NewInputParameterError("lb region %s does not match eip region %s ",
+				region.GetId(), eip.CloudregionId)
+		}
+		if eip.Status != api.EIP_STATUS_READY {
+			return nil, httperrors.NewInvalidStatusError("eip %s status not ready", eip.Name)
+		}
+		if len(eip.AssociateType) > 0 {
+			return nil, httperrors.NewInvalidStatusError("eip %s alread associate %s", eip.Name, eip.AssociateType)
+		}
+		data.Set("eip_id", jsonutils.NewString(eip.Id))
+	}
+
 	data.Set("cloudregion_id", jsonutils.NewString(region.GetId()))
 	data.Set("zone_id", jsonutils.NewString(zone.GetId()))
 	data.Set("vpc_id", jsonutils.NewString(vpc.GetId()))
-	data.Set("network_type", jsonutils.NewString(api.LB_NETWORK_TYPE_CLASSIC))
+	data.Set("network_id", jsonutils.NewString(network.Id))
+	data.Set("network_type", jsonutils.NewString(lbNetworkType))
 	data.Set("address_type", jsonutils.NewString(api.LB_ADDR_TYPE_INTRANET))
 	return data, nil
 }
@@ -232,7 +302,7 @@ func (self *SKVMRegionDriver) ValidateCreateLoadbalancerBackendData(ctx context.
 
 	name, _ := data.GetString("name")
 	if name == "" {
-		name = fmt.Sprintf("%s-%s-%s-%s", backendGroup.Name, backendType, basename, rand.String(4))
+		name = fmt.Sprintf("%s-%s-%s-%s", backendGroup.Name, backendType, basename, randutil.String(4))
 	}
 
 	switch backendType {
@@ -707,26 +777,73 @@ func (self *SKVMRegionDriver) ValidateUpdateLoadbalancerListenerData(ctx context
 func (self *SKVMRegionDriver) RequestCreateLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *models.SLoadbalancer, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		_, err := db.Update(lb, func() error {
-			if lb.AddressType == api.LB_ADDR_TYPE_INTRANET {
-				// TODO support use reserved ip address
-				// TODO prefer ip address from server_type loadbalancer?
-				req := &models.SLoadbalancerNetworkRequestData{
-					Loadbalancer: lb,
-					NetworkId:    lb.NetworkId,
-					Address:      lb.Address,
-				}
-				// NOTE the small window when agents can see the ephemeral address
-				ln, err := models.LoadbalancernetworkManager.NewLoadbalancerNetwork(ctx, userCred, req)
-				if err != nil {
-					log.Errorf("allocating loadbalancer network failed: %v, req: %#v", err, req)
-					lb.Address = ""
-				} else {
-					lb.Address = ln.IpAddr
-				}
+			// TODO support use reserved ip address
+			req := &models.SLoadbalancerNetworkRequestData{
+				Loadbalancer: lb,
+				NetworkId:    lb.NetworkId,
+				Address:      lb.Address,
+			}
+			// NOTE the small window when agents can see the ephemeral address
+			ln, err := models.LoadbalancernetworkManager.NewLoadbalancerNetwork(ctx, userCred, req)
+			if err != nil {
+				log.Errorf("allocating loadbalancer network failed: %v, req: %#v", err, req)
+				lb.Address = ""
+			} else {
+				lb.Address = ln.IpAddr
 			}
 			return nil
 		})
-		return nil, err
+		if err != nil {
+			return nil, errors.Wrapf(err, "db.Update")
+		}
+		// bind eip
+		eipId, _ := task.GetParams().GetString("eip_id")
+		eipBw, _ := task.GetParams().Int("eip_bw")
+		if eipBw > 0 && len(eipId) == 0 {
+			// create eip first
+			bgpType, _ := task.GetParams().GetString("eip_bgp_type")
+			chargeType, _ := task.GetParams().GetString("eip_charge_type")
+			autoDellocate := jsonutils.QueryBoolean(task.GetParams(), "eip_auto_dellocate", false)
+
+			eipPendingUsage := &models.SRegionQuota{Eip: 1}
+			eipPendingUsage.SetKeys(lb.GetQuotaKeys())
+			eip, err := models.ElasticipManager.NewEipForVMOnHost(ctx, userCred, &models.NewEipForVMOnHostArgs{
+				Bandwidth:     int(eipBw),
+				BgpType:       bgpType,
+				ChargeType:    chargeType,
+				AutoDellocate: autoDellocate,
+
+				Loadbalancer: lb,
+				PendingUsage: eipPendingUsage,
+			})
+			if err != nil {
+				log.Errorf("NewEipForVMOnHost fail %s", err)
+				quotas.CancelPendingUsage(ctx, userCred, eipPendingUsage, eipPendingUsage, false)
+			} else {
+				opts := api.ElasticipAssociateInput{
+					InstanceId:         lb.Id,
+					InstanceExternalId: lb.ExternalId,
+					InstanceType:       api.EIP_ASSOCIATE_TYPE_LOADBALANCER,
+				}
+
+				err = eip.AllocateAndAssociateInstance(ctx, userCred, lb, opts, "")
+				if err != nil {
+					return nil, errors.Wrap(err, "AllocateAndAssociateInstance")
+				}
+			}
+		} else if len(eipId) > 0 {
+			_eip, err := models.ElasticipManager.FetchById(eipId)
+			if err != nil {
+				return nil, errors.Wrapf(err, "ElasticipManager.FetchById(%s)", eipId)
+			}
+			eip := _eip.(*models.SElasticip)
+			err = eip.AssociateLoadbalancer(ctx, userCred, lb)
+			if err != nil {
+				return nil, errors.Wrapf(err, "eip.AssociateLoadbalancer")
+			}
+		}
+
+		return nil, nil
 	})
 	return nil
 }
@@ -1008,9 +1125,25 @@ func (self *SKVMRegionDriver) RequestDeleteInstanceSnapshot(ctx context.Context,
 	}
 	if len(snapshots) == 0 {
 		task.SetStage("OnInstanceSnapshotDelete", nil)
-		taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-			return nil, nil
-		})
+		if isp.WithMemory && isp.MemoryFileHostId != "" && isp.MemoryFilePath != "" {
+			// request delete memory snapshot
+			host := models.HostManager.FetchHostById(isp.MemoryFileHostId)
+			if host == nil {
+				return errors.Errorf("Not found host by %q", isp.MemoryFileHostId)
+			}
+			header := task.GetTaskRequestHeader()
+			url := fmt.Sprintf("%s/servers/memory-snapshot", host.ManagerUri)
+			if _, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "DELETE", url, header, jsonutils.Marshal(&hostapi.GuestMemorySnapshotDeleteRequest{
+				InstanceSnapshotId: isp.GetId(),
+				Path:               isp.MemoryFilePath,
+			}), false); err != nil {
+				return err
+			}
+		} else {
+			taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+				return nil, nil
+			})
+		}
 		return nil
 	}
 
@@ -1039,7 +1172,8 @@ func (self *SKVMRegionDriver) RequestDeleteInstanceBackup(ctx context.Context, i
 	params := jsonutils.NewDict()
 	params.Set("del_backup_id", jsonutils.NewString(backups[0].Id))
 	task.SetStage("OnKvmDiskBackupDelete", params)
-	err = backups[0].StartBackupDeleteTask(ctx, task.GetUserCred(), task.GetTaskId())
+	forceDelete := jsonutils.QueryBoolean(task.GetParams(), "force_delete", false)
+	err = backups[0].StartBackupDeleteTask(ctx, task.GetUserCred(), task.GetTaskId(), forceDelete)
 	if err != nil {
 		return err
 	}
@@ -1047,41 +1181,62 @@ func (self *SKVMRegionDriver) RequestDeleteInstanceBackup(ctx context.Context, i
 }
 
 func (self *SKVMRegionDriver) RequestResetToInstanceSnapshot(ctx context.Context, guest *models.SGuest, isp *models.SInstanceSnapshot, task taskman.ITask, params *jsonutils.JSONDict) error {
-	disks, _ := guest.GetGuestDisks()
+	jIsps, err := isp.GetInstanceSnapshotJointsByOrder(guest)
+	if err != nil {
+		return errors.Wrap(err, "GetInstanceSnapshotJointsByOrder")
+	}
 	diskIndexI64, err := params.Int("disk_index")
 	if err != nil {
 		return errors.Wrap(err, "get 'disk_index' from params")
 	}
 	diskIndex := int(diskIndexI64)
-	if diskIndex >= len(disks) {
+	if diskIndex >= len(jIsps) {
 		task.SetStage("OnInstanceSnapshotReset", nil)
-		taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-			return nil, nil
-		})
+		withMem := jsonutils.QueryBoolean(params, "with_memory", false)
+		if isp.WithMemory && withMem {
+			// reset do memory snapshot
+			host, err := guest.GetHost()
+			if err != nil {
+				return err
+			}
+			header := task.GetTaskRequestHeader()
+			url := fmt.Sprintf("%s/servers/%s/memory-snapshot-reset", host.ManagerUri, guest.GetId())
+			if _, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, jsonutils.Marshal(&hostapi.GuestMemorySnapshotResetRequest{
+				InstanceSnapshotId: isp.GetId(),
+				Path:               isp.MemoryFilePath,
+				Checksum:           isp.MemoryFileChecksum,
+			}), false); err != nil {
+				return err
+			}
+		} else {
+			taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+				return nil, nil
+			})
+		}
 		return nil
 	}
 
-	isj, err := isp.GetInstanceSnapshotJointAt(diskIndex)
-	if err != nil {
-		return err
-	}
+	isj := jIsps[diskIndex]
 
 	params = jsonutils.NewDict()
 	params.Set("disk_index", jsonutils.NewInt(int64(diskIndex)))
 	task.SetStage("OnKvmDiskReset", params)
 
-	disk := disks[diskIndex].GetDisk()
+	disk, err := isj.GetSnapshotDisk()
+	if err != nil {
+		return errors.Wrapf(err, "Get %d snapshot disk", diskIndex)
+	}
 	err = disk.StartResetDisk(ctx, task.GetUserCred(), isj.SnapshotId, false, guest, task.GetTaskId())
 	if err != nil {
-		return err
+		return errors.Wrap(err, "StartResetDisk")
 	}
 	return nil
 }
 
 func (self *SKVMRegionDriver) ValidateCreateSnapshotData(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, storage *models.SStorage, input *api.SnapshotCreateInput) error {
-	host := storage.GetMasterHost()
-	if host == nil {
-		return fmt.Errorf("failed to get master host, maybe the host is offline")
+	_, err := storage.GetMasterHost()
+	if err != nil {
+		return errors.Wrapf(err, "storage.GetMasterHost")
 	}
 	return models.GetStorageDriver(storage.StorageType).ValidateCreateSnapshotData(ctx, userCred, disk, input)
 }
@@ -1103,9 +1258,24 @@ func (self *SKVMRegionDriver) RequestCreateInstanceSnapshot(ctx context.Context,
 	diskIndex := int(diskIndexI64)
 	if diskIndex >= len(disks) {
 		task.SetStage("OnInstanceSnapshot", nil)
-		taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-			return nil, nil
-		})
+		if isp.WithMemory {
+			// request do memory snapshot
+			host, err := guest.GetHost()
+			if err != nil {
+				return err
+			}
+			header := task.GetTaskRequestHeader()
+			url := fmt.Sprintf("%s/servers/%s/memory-snapshot", host.ManagerUri, guest.GetId())
+			if _, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, jsonutils.Marshal(&hostapi.GuestMemorySnapshotRequest{
+				InstanceSnapshotId: isp.GetId(),
+			}), false); err != nil {
+				return err
+			}
+		} else {
+			taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+				return nil, nil
+			})
+		}
 		return nil
 	}
 
@@ -1114,17 +1284,22 @@ func (self *SKVMRegionDriver) RequestCreateInstanceSnapshot(ctx context.Context,
 		defer lockman.ReleaseClass(ctx, models.SnapshotManager, "name")
 
 		snapshotName, err := db.GenerateName(ctx, models.SnapshotManager, task.GetUserCred(),
-			fmt.Sprintf("%s-%s", isp.Name, rand.String(8)))
+			fmt.Sprintf("%s-%s", isp.Name, randutil.String(8)))
 		if err != nil {
 			return nil, errors.Wrap(err, "Generate snapshot name")
 		}
 
 		return models.SnapshotManager.CreateSnapshot(
 			ctx, task.GetUserCred(), api.SNAPSHOT_MANUAL, disks[diskIndex].DiskId,
-			guest.Id, "", snapshotName, -1)
+			guest.Id, "", snapshotName, -1, false)
 	}()
 	if err != nil {
 		return err
+	}
+
+	err = isp.InheritTo(ctx, snapshot)
+	if err != nil {
+		return errors.Wrapf(err, "unable to inherit from instance snapshot %s to snapshot %s", isp.GetId(), snapshot.GetId())
 	}
 
 	err = models.InstanceSnapshotJointManager.CreateJoint(ctx, isp.Id, snapshot.Id, int8(diskIndex))
@@ -1153,6 +1328,9 @@ func (self *SKVMRegionDriver) GetDiskResetParams(snapshot *models.SSnapshot) *js
 	params.Set("snapshot_id", jsonutils.NewString(snapshot.Id))
 	params.Set("out_of_chain", jsonutils.NewBool(snapshot.OutOfChain))
 	params.Set("location", jsonutils.NewString(snapshot.Location))
+	if len(snapshot.BackingDiskId) > 0 {
+		params.Set("backing_disk_id", jsonutils.NewString(snapshot.BackingDiskId))
+	}
 	return params
 }
 
@@ -1229,8 +1407,14 @@ func (self *SKVMRegionDriver) OnSnapshotDelete(ctx context.Context, snapshot *mo
 
 func (self *SKVMRegionDriver) RequestSyncDiskStatus(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		storage, _ := disk.GetStorage()
-		host := storage.GetMasterHost()
+		storage, err := disk.GetStorage()
+		if err != nil {
+			return nil, errors.Wrapf(err, "disk.GetStorage")
+		}
+		host, err := storage.GetMasterHost()
+		if err != nil {
+			return nil, errors.Wrapf(err, "storage.GetMasterHost")
+		}
 		header := task.GetTaskRequestHeader()
 		url := fmt.Sprintf("%s/disks/%s/%s/status", host.ManagerUri, storage.Id, disk.Id)
 		_, res, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "GET", url, header, nil, false)
@@ -1264,7 +1448,7 @@ func (self *SKVMRegionDriver) RequestCreateInstanceBackup(ctx context.Context, g
 			defer lockman.ReleaseClass(ctx, models.DiskBackupManager, "name")
 
 			diskBackupName, err := db.GenerateName(ctx, models.DiskBackupManager, task.GetUserCred(),
-				fmt.Sprintf("%s-%s", ib.Name, rand.String(8)))
+				fmt.Sprintf("%s-%s", ib.Name, randutil.String(8)))
 			if err != nil {
 				return nil, errors.Wrap(err, "Generate diskbackup name")
 			}
@@ -1273,6 +1457,10 @@ func (self *SKVMRegionDriver) RequestCreateInstanceBackup(ctx context.Context, g
 		}()
 		if err != nil {
 			return err
+		}
+		err = ib.InheritTo(ctx, backup)
+		if err != nil {
+			return errors.Wrapf(err, "unable to inherit from instance backup %s to backup %s", ib.GetId(), backup.GetId())
 		}
 		err = models.InstanceBackupJointManager.CreateJoint(ctx, ib.Id, backup.Id, int8(i))
 		if err != nil {
@@ -1284,6 +1472,136 @@ func (self *SKVMRegionDriver) RequestCreateInstanceBackup(ctx context.Context, g
 			return err
 		}
 	}
+	return nil
+}
+
+func (self *SKVMRegionDriver) RequestPackInstanceBackup(ctx context.Context, ib *models.SInstanceBackup, task taskman.ITask, packageName string) error {
+	backupStorage, err := ib.GetBackupStorage()
+	if err != nil {
+		return errors.Wrap(err, "unable to get backupStorage")
+	}
+	backups, err := ib.GetBackups()
+	if err != nil {
+		return errors.Wrap(err, "unable to get backups")
+	}
+	storage, err := backups[0].GetStorage()
+	if err != nil {
+		return errors.Wrapf(err, "GetStorage")
+	}
+	host, _ := storage.GetMasterHost()
+	if host == nil {
+		host, err = models.HostManager.GetEnabledKvmHost()
+		if err != nil {
+			return errors.Wrap(err, "unable to GetEnabledKvmHost")
+		}
+	}
+	backupIds := make([]string, len(backups))
+	for i := range backupIds {
+		backupIds[i] = backups[i].GetId()
+	}
+	metadata, err := ib.PackMetadata(ctx, task.GetUserCred())
+	if err != nil {
+		return errors.Wrap(err, "unable to PackMetadata")
+	}
+	url := fmt.Sprintf("%s/storages/pack-instance-backup", host.ManagerUri)
+	body := jsonutils.NewDict()
+	body.Set("package_name", jsonutils.NewString(packageName))
+	body.Set("backup_storage_id", jsonutils.NewString(backupStorage.GetId()))
+	body.Set("backup_storage_access_info", jsonutils.Marshal(backupStorage.AccessInfo))
+	body.Set("backup_ids", jsonutils.Marshal(backupIds))
+	body.Set("metadata", jsonutils.Marshal(metadata))
+	header := task.GetTaskRequestHeader()
+	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	if err != nil {
+		return errors.Wrap(err, "unable to pack instancebackup")
+	}
+	return nil
+}
+
+func (self *SKVMRegionDriver) RequestUnpackInstanceBackup(ctx context.Context, ib *models.SInstanceBackup, task taskman.ITask, packageName string, metadataOnly bool) error {
+	log.Infof("RequestUnpackInstanceBackup")
+	backupStorage, err := ib.GetBackupStorage()
+	if err != nil {
+		return errors.Wrap(err, "unable to get backupStorage")
+	}
+	host, err := models.HostManager.GetEnabledKvmHost()
+	if err != nil {
+		return errors.Wrap(err, "unable to GetEnabledKvmHost")
+	}
+	url := fmt.Sprintf("%s/storages/unpack-instance-backup", host.ManagerUri)
+	log.Infof("url: %s", url)
+	body := jsonutils.NewDict()
+	body.Set("package_name", jsonutils.NewString(packageName))
+	body.Set("backup_storage_id", jsonutils.NewString(backupStorage.GetId()))
+	body.Set("backup_storage_access_info", jsonutils.Marshal(backupStorage.AccessInfo))
+	if metadataOnly {
+		body.Set("metadata_only", jsonutils.JSONTrue)
+	}
+	header := task.GetTaskRequestHeader()
+	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	if err != nil {
+		return errors.Wrap(err, "unable to pack instancebackup")
+	}
+	return nil
+}
+
+func (self *SKVMRegionDriver) RequestSyncBackupStorageStatus(ctx context.Context, userCred mcclient.TokenCredential, bs *models.SBackupStorage, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		host, err := models.HostManager.GetEnabledKvmHost()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to GetEnabledKvmHost")
+		}
+		url := fmt.Sprintf("%s/storages/sync-backup-storage", host.ManagerUri)
+		body := jsonutils.NewDict()
+		body.Set("backup_storage_id", jsonutils.NewString(bs.GetId()))
+		body.Set("backup_storage_access_info", jsonutils.Marshal(bs.AccessInfo))
+		header := task.GetTaskRequestHeader()
+		_, res, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+		if err != nil {
+			return nil, err
+		}
+		status, _ := res.GetString("status")
+		reason, _ := res.GetString("reason")
+		return nil, bs.SetStatus(userCred, status, reason)
+	})
+	return nil
+}
+
+func (self *SKVMRegionDriver) RequestSyncInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, ib *models.SInstanceBackup, task taskman.ITask) error {
+	originStatus, _ := task.GetParams().GetString("origin_status")
+	if utils.IsInStringArray(originStatus, []string{
+		api.INSTANCE_BACKUP_STATUS_CREATING,
+		api.INSTANCE_BACKUP_STATUS_DELETING,
+		// api.INSTANCE_BACKUP_STATUS_RECOVERY,
+		api.INSTANCE_BACKUP_STATUS_PACK,
+		api.INSTANCE_BACKUP_STATUS_CREATING_FROM_PACKAGE,
+		api.INSTANCE_BACKUP_STATUS_SAVING,
+		api.INSTANCE_BACKUP_STATUS_SNAPSHOT,
+	}) {
+		err := ib.SetStatus(userCred, originStatus, "sync status")
+		if err != nil {
+			return err
+		}
+		task.SetStageComplete(ctx, nil)
+		return nil
+	}
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		task.SetStage("OnKvmBackupSyncstatus", nil)
+		backups, err := ib.GetBackups()
+		if err != nil {
+			return nil, errors.Wrap(err, "unable to get backups")
+		}
+		for i := range backups {
+			params := jsonutils.NewDict()
+			params.Add(jsonutils.NewString(backups[i].GetStatus()), "origin_status")
+			task, err := taskman.TaskManager.NewTask(ctx, "DiskBackupSyncstatusTask", &backups[i], userCred, params, task.GetTaskId(), "", nil)
+			if err != nil {
+				return nil, err
+			}
+			task.ScheduleRun(nil)
+		}
+		return nil, nil
+	})
 	return nil
 }
 
@@ -1300,7 +1618,7 @@ func (self *SKVMRegionDriver) RequestSyncDiskBackupStatus(ctx context.Context, u
 		storage, _ := backup.GetStorage()
 		var host *models.SHost
 		if storage != nil {
-			host = storage.GetMasterHost()
+			host, _ = storage.GetMasterHost()
 		}
 		if host == nil {
 			host, err = models.HostManager.GetEnabledKvmHost()
@@ -1324,7 +1642,7 @@ func (self *SKVMRegionDriver) RequestSyncDiskBackupStatus(ctx context.Context, u
 		if status == api.BACKUP_EXIST {
 			backupStatus = api.BACKUP_STATUS_READY
 		} else {
-			backupStatus = api.SNAPSHOT_UNKNOWN
+			backupStatus = api.BACKUP_STATUS_UNKNOWN
 		}
 		return nil, backup.SetStatus(userCred, backupStatus, "sync status")
 	})
@@ -1334,7 +1652,10 @@ func (self *SKVMRegionDriver) RequestSyncDiskBackupStatus(ctx context.Context, u
 func (self *SKVMRegionDriver) RequestSyncSnapshotStatus(ctx context.Context, userCred mcclient.TokenCredential, snapshot *models.SSnapshot, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		storage := snapshot.GetStorage()
-		host := storage.GetMasterHost()
+		host, err := storage.GetMasterHost()
+		if err != nil {
+			return nil, errors.Wrapf(err, "storage.GetMasterHost")
+		}
 		header := task.GetTaskRequestHeader()
 		url := fmt.Sprintf("%s/snapshots/%s/%s/%s/status", host.ManagerUri, storage.Id, snapshot.DiskId, snapshot.Id)
 		_, res, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "GET", url, header, nil, false)
@@ -1498,7 +1819,7 @@ func (self *SKVMRegionDriver) AllowUpdateElasticcacheAuthMode(ctx context.Contex
 
 func (self *SKVMRegionDriver) RequestSyncBucketStatus(ctx context.Context, userCred mcclient.TokenCredential, bucket *models.SBucket, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iBucket, err := bucket.GetIBucket()
+		iBucket, err := bucket.GetIBucket(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "bucket.GetIBucket")
 		}
@@ -1524,7 +1845,7 @@ func (self *SKVMRegionDriver) RequestDeleteBackup(ctx context.Context, backup *m
 	storage, _ := backup.GetStorage()
 	var host *models.SHost
 	if storage != nil {
-		host = storage.GetMasterHost()
+		host, _ = storage.GetMasterHost()
 	}
 	if host == nil {
 		host, err = models.HostManager.GetEnabledKvmHost()
@@ -1569,6 +1890,9 @@ func (self *SKVMRegionDriver) RequestCreateBackup(ctx context.Context, backup *m
 	body.Set("backup_id", jsonutils.NewString(backup.GetId()))
 	body.Set("backup_storage_id", jsonutils.NewString(backupStroage.GetId()))
 	body.Set("backup_storage_access_info", jsonutils.Marshal(backupStroage.AccessInfo))
+	if len(backup.EncryptKeyId) > 0 {
+		body.Set("encrypt_key_id", jsonutils.NewString(backup.EncryptKeyId))
+	}
 	header := task.GetTaskRequestHeader()
 	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
 	if err != nil {
@@ -1577,87 +1901,27 @@ func (self *SKVMRegionDriver) RequestCreateBackup(ctx context.Context, backup *m
 	return nil
 }
 
-func (self *SKVMRegionDriver) RequestAssociatEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
+func (self *SKVMRegionDriver) RequestAssociateEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		if input.InstanceType == api.EIP_ASSOCIATE_TYPE_SERVER {
-			guest := obj.(*models.SGuest)
-
-			if guest.GetHypervisor() != api.HYPERVISOR_KVM {
-				return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "not support associate eip for hypervisor %s", guest.GetHypervisor())
+		switch input.InstanceType {
+		case api.EIP_ASSOCIATE_TYPE_SERVER:
+			err := self.requestAssociateEipWithServer(ctx, userCred, eip, input, obj, task)
+			if err != nil {
+				return nil, err
 			}
-
-			lockman.LockObject(ctx, guest)
-			defer lockman.ReleaseObject(ctx, guest)
-
-			var guestnics []models.SGuestnetwork
-			{
-				netq := models.NetworkManager.Query().SubQuery()
-				wirq := models.WireManager.Query().SubQuery()
-				vpcq := models.VpcManager.Query().SubQuery()
-				gneq := models.GuestnetworkManager.Query()
-				q := gneq.Equals("guest_id", guest.Id).
-					IsNullOrEmpty("eip_id")
-				if len(input.IpAddr) > 0 {
-					q = q.Equals("ip_addr", input.IpAddr)
-				}
-				q = q.Join(netq, sqlchemy.Equals(netq.Field("id"), gneq.Field("network_id")))
-				q = q.Join(wirq, sqlchemy.Equals(wirq.Field("id"), netq.Field("wire_id")))
-				q = q.Join(vpcq, sqlchemy.Equals(vpcq.Field("id"), wirq.Field("vpc_id")))
-				q = q.Filter(sqlchemy.NotEquals(vpcq.Field("id"), api.DEFAULT_VPC_ID))
-				if err := db.FetchModelObjects(models.GuestnetworkManager, q, &guestnics); err != nil {
-					return nil, errors.Wrapf(err, "db.FetchModelObjects")
-				}
-				if len(guestnics) == 0 {
-					return nil, errors.Errorf("guest has no nics to associate eip")
-				}
+		case api.EIP_ASSOCIATE_TYPE_INSTANCE_GROUP:
+			err := self.requestAssociateEipWithInstanceGroup(ctx, userCred, eip, input, obj, task)
+			if err != nil {
+				return nil, err
 			}
-
-			guestnic := &guestnics[0]
-			lockman.LockObject(ctx, guestnic)
-			defer lockman.ReleaseObject(ctx, guestnic)
-			if _, err := db.Update(guestnic, func() error {
-				guestnic.EipId = eip.Id
-				return nil
-			}); err != nil {
-				return nil, errors.Wrapf(err, "set associated eip for guestnic %s (guest:%s, network:%s)",
-					guestnic.Ifname, guestnic.GuestId, guestnic.NetworkId)
+		case api.EIP_ASSOCIATE_TYPE_LOADBALANCER:
+			err := self.requestAssociateEipWithLoadbalancer(ctx, userCred, eip, input, obj, task)
+			if err != nil {
+				return nil, err
 			}
-		} else if input.InstanceType == api.EIP_ASSOCIATE_TYPE_INSTANCE_GROUP {
-			group := obj.(*models.SGroup)
-
-			lockman.LockObject(ctx, group)
-			defer lockman.ReleaseObject(ctx, group)
-
-			var groupnics []models.SGroupnetwork
-			{
-				gneq := models.GroupnetworkManager.Query()
-				q := gneq.Equals("group_id", group.Id).
-					IsNullOrEmpty("eip_id")
-				if len(input.IpAddr) > 0 {
-					q = q.Equals("ip_addr", input.IpAddr)
-				}
-				if err := db.FetchModelObjects(models.GroupnetworkManager, q, &groupnics); err != nil {
-					return nil, errors.Wrapf(err, "db.FetchModelObjects")
-				}
-				if len(groupnics) == 0 {
-					return nil, errors.Errorf("guest has no nics to associate eip")
-				}
-			}
-
-			groupnic := &groupnics[0]
-			lockman.LockObject(ctx, groupnic)
-			defer lockman.ReleaseObject(ctx, groupnic)
-			if _, err := db.Update(groupnic, func() error {
-				groupnic.EipId = eip.Id
-				return nil
-			}); err != nil {
-				return nil, errors.Wrapf(err, "set associated eip for groupnic %s (guest:%s, network:%s)",
-					groupnic.IpAddr, groupnic.GroupId, groupnic.NetworkId)
-			}
-		} else {
+		default:
 			return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "instance type %s", input.InstanceType)
 		}
-
 		if err := eip.AssociateInstance(ctx, userCred, input.InstanceType, obj); err != nil {
 			return nil, errors.Wrapf(err, "associate eip %s(%s) to %s %s(%s)", eip.Name, eip.Id, obj.Keyword(), obj.GetName(), obj.GetId())
 		}
@@ -1666,5 +1930,113 @@ func (self *SKVMRegionDriver) RequestAssociatEip(ctx context.Context, userCred m
 		}
 		return nil, nil
 	})
+	return nil
+}
+
+func (self *SKVMRegionDriver) requestAssociateEipWithServer(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
+	guest := obj.(*models.SGuest)
+
+	if guest.GetHypervisor() != api.HYPERVISOR_KVM {
+		return errors.Wrapf(cloudprovider.ErrNotSupported, "not support associate eip for hypervisor %s", guest.GetHypervisor())
+	}
+
+	lockman.LockObject(ctx, guest)
+	defer lockman.ReleaseObject(ctx, guest)
+
+	var guestnics []models.SGuestnetwork
+	{
+		netq := models.NetworkManager.Query().SubQuery()
+		wirq := models.WireManager.Query().SubQuery()
+		vpcq := models.VpcManager.Query().SubQuery()
+		gneq := models.GuestnetworkManager.Query()
+		q := gneq.Equals("guest_id", guest.Id).
+			IsNullOrEmpty("eip_id")
+		if len(input.IpAddr) > 0 {
+			q = q.Equals("ip_addr", input.IpAddr)
+		}
+		q = q.Join(netq, sqlchemy.Equals(netq.Field("id"), gneq.Field("network_id")))
+		q = q.Join(wirq, sqlchemy.Equals(wirq.Field("id"), netq.Field("wire_id")))
+		q = q.Join(vpcq, sqlchemy.Equals(vpcq.Field("id"), wirq.Field("vpc_id")))
+		q = q.Filter(sqlchemy.NotEquals(vpcq.Field("id"), api.DEFAULT_VPC_ID))
+		if err := db.FetchModelObjects(models.GuestnetworkManager, q, &guestnics); err != nil {
+			return errors.Wrapf(err, "db.FetchModelObjects")
+		}
+		if len(guestnics) == 0 {
+			return errors.Errorf("guest has no nics to associate eip")
+		}
+	}
+
+	guestnic := &guestnics[0]
+	lockman.LockObject(ctx, guestnic)
+	defer lockman.ReleaseObject(ctx, guestnic)
+	if _, err := db.Update(guestnic, func() error {
+		guestnic.EipId = eip.Id
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "set associated eip for guestnic %s (guest:%s, network:%s)",
+			guestnic.Ifname, guestnic.GuestId, guestnic.NetworkId)
+	}
+	return nil
+}
+
+func (self *SKVMRegionDriver) requestAssociateEipWithInstanceGroup(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
+	group := obj.(*models.SGroup)
+
+	lockman.LockObject(ctx, group)
+	defer lockman.ReleaseObject(ctx, group)
+
+	var groupnics []models.SGroupnetwork
+	{
+		gneq := models.GroupnetworkManager.Query()
+		q := gneq.Equals("group_id", group.Id).
+			IsNullOrEmpty("eip_id")
+		if len(input.IpAddr) > 0 {
+			q = q.Equals("ip_addr", input.IpAddr)
+		}
+		if err := db.FetchModelObjects(models.GroupnetworkManager, q, &groupnics); err != nil {
+			return errors.Wrapf(err, "db.FetchModelObjects")
+		}
+		if len(groupnics) == 0 {
+			return errors.Errorf("instance group has no nics to associate eip")
+		}
+	}
+
+	groupnic := &groupnics[0]
+	lockman.LockObject(ctx, groupnic)
+	defer lockman.ReleaseObject(ctx, groupnic)
+	if _, err := db.Update(groupnic, func() error {
+		groupnic.EipId = eip.Id
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "set associated eip for groupnic %s (guest:%s, network:%s)",
+			groupnic.IpAddr, groupnic.GroupId, groupnic.NetworkId)
+	}
+	return nil
+}
+
+func (self *SKVMRegionDriver) requestAssociateEipWithLoadbalancer(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	eip *models.SElasticip,
+	input api.ElasticipAssociateInput,
+	obj db.IStatusStandaloneModel,
+	task taskman.ITask,
+) error {
+	lb := obj.(*models.SLoadbalancer)
+
+	if _, err := db.Update(lb, func() error {
+		lb.Address = eip.IpAddr
+		lb.AddressType = api.LB_ADDR_TYPE_INTERNET
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "set loadbalancer address")
+	}
+
+	if err := eip.AssociateLoadbalancer(ctx, userCred, lb); err != nil {
+		return errors.Wrapf(err, "associate eip %s(%s) to loadbalancer %s(%s)", eip.Name, eip.Id, lb.Name, lb.Id)
+	}
+	if err := eip.SetStatus(userCred, api.EIP_STATUS_READY, api.EIP_STATUS_ASSOCIATE); err != nil {
+		return errors.Wrapf(err, "set eip status to %s", api.EIP_STATUS_ALLOCATE)
+	}
 	return nil
 }

@@ -37,6 +37,7 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
+	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
 type Usage map[string]interface{}
@@ -106,6 +107,12 @@ func rangeObjHandler(
 			httperrors.GeneralServerError(ctx, w, err)
 			return
 		}
+		projectTags := &tagutils.TTagSetList{}
+		getQuery(r).Unmarshal(projectTags, "project_tags")
+		for i := range result.ProjectTags {
+			projectTags.Append(result.ProjectTags[i])
+		}
+		result.ProjectTags = *projectTags
 		isOwner := false
 		if scope == rbacutils.ScopeDomain && obj != nil && db.IsObjectRbacAllowed(ctx, obj, userCred, policy.PolicyActionGet, "usage") == nil {
 			isOwner = true
@@ -123,7 +130,7 @@ func rangeObjHandler(
 			rangeObjs = []db.IStandaloneModel{obj}
 		}
 		refresh := json.QueryBoolean(query, "refresh", false)
-		key := getCacheKey(scope, ownerId, isOwner, rangeObjs, hostTypes, providers, brands, cloudEnv, includeSystem)
+		key := getCacheKey(scope, ownerId, isOwner, rangeObjs, hostTypes, providers, brands, cloudEnv, includeSystem, *projectTags)
 		if !refresh {
 			cached := usageCache.Get(key)
 			if cached != nil {
@@ -231,8 +238,8 @@ func getSystemGeneralUsage(
 		pcpuTotal = float64(host.CpuCount)
 		count.Add("memory", host.MemSize)
 		count.Add("cpu", host.CpuCount)
-		count.Add("memory.virtual", host.GetVirtualMemorySize())
-		count.Add("cpu.virtual", host.GetVirtualCPUCount())
+		count.Add("memory.virtual", int64(host.GetVirtualMemorySize()))
+		count.Add("cpu.virtual", int64(host.GetVirtualCPUCount()))
 	}
 
 	guestRunningUsage := GuestRunningUsage("all.running_servers", rbacutils.ScopeSystem, nil, rangeObjs, hostTypes, []string{api.HostResourceTypeShared}, providers, brands, cloudEnv, includeSystem, policyResult)
@@ -844,8 +851,8 @@ func hostUsage(
 	count[fmt.Sprintf("%s.memory.total", prefix)] = result.MemoryTotal
 	count[fmt.Sprintf("%s.cpu", prefix)] = result.CPU
 	count[fmt.Sprintf("%s.cpu.total", prefix)] = result.CPUTotal
-	count[fmt.Sprintf("%s.memory.virtual", prefix)] = result.MemoryVirtual
-	count[fmt.Sprintf("%s.cpu.virtual", prefix)] = result.CPUVirtual
+	count[fmt.Sprintf("%s.memory.virtual", prefix)] = int64(result.MemoryVirtual)
+	count[fmt.Sprintf("%s.cpu.virtual", prefix)] = int64(result.CPUVirtual)
 	count[fmt.Sprintf("%s.memory.reserved", prefix)] = result.MemoryReserved
 	count[fmt.Sprintf("%s.memory.reserved.isolated", prefix)] = result.IsolatedReservedMemory
 	count[fmt.Sprintf("%s.cpu.reserved.isolated", prefix)] = result.IsolatedReservedCpu
